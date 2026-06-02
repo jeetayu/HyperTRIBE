@@ -1,0 +1,61 @@
+# Snakemake SLURM Profile Configuration
+# ======================================
+# Place this directory at  slurm/  relative to the Snakefile, then run:
+#
+#   snakemake --profile slurm --configfile config.yaml
+#
+# Snakemake 7.x uses the --profile flag to load this config.yaml automatically.
+# Each rule is submitted as a separate sbatch job; the pipeline itself runs
+# as a lightweight controller job (see submit_pipeline.sh).
+
+# ── Cluster submission command ────────────────────────────────────────────────
+# {cluster.*} tokens are filled from slurm/cluster.yaml per rule.
+# {threads} comes from the Snakefile rule's `threads:` directive.
+cluster: >-
+  sbatch
+  --account={cluster.account}
+  --partition={cluster.partition}
+  --time={cluster.time}
+  --mem={cluster.mem}
+  --cpus-per-task={threads}
+  --job-name=ht_{rule}_{wildcards}
+  --output=logs/slurm/{rule}_%j.out
+  --error=logs/slurm/{rule}_%j.err
+  --parsable
+
+# Path to per-rule resource overrides (relative to Snakefile location)
+cluster-config: "slurm/cluster.yaml"
+
+# ── Job control ────────────────────────────────────────────────────────────────
+# Maximum number of jobs submitted to the queue simultaneously
+jobs: 50
+
+# Seconds to wait for output files to appear after a job finishes
+# (needed on networked filesystems like Lustre/GPFS)
+latency-wait: 120
+
+# Continue submitting independent jobs after a failure
+keep-going: true
+
+# Re-run any jobs whose output files are incomplete (e.g. after a crash)
+rerun-incomplete: true
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+printshellcmds: true
+
+# ── Snakemake behaviour ───────────────────────────────────────────────────────
+# Use conda environment defined in environment.yml
+use-conda: false      # set to true if you want Snakemake to manage conda envs
+
+# Restart a rule this many times before marking it as failed
+restart-times: 1
+
+# ── Notes ─────────────────────────────────────────────────────────────────────
+# 1. Before first run, build the SLURM log directory:
+#       mkdir -p logs/slurm
+#
+# 2. Do a dry-run to verify the DAG before submitting:
+#       snakemake --profile slurm --configfile config.yaml -n
+#
+# 3. Generate a DAG diagram:
+#       snakemake --profile slurm --configfile config.yaml --dag | dot -Tpng > dag.png

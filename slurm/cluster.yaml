@@ -1,0 +1,81 @@
+# HyperTRIBE SLURM Resource Configuration
+# =========================================
+# Per-rule resource overrides for Snakemake cluster execution.
+# Adjust partition names and account to match your HPC setup.
+#
+# Usage (referenced automatically by slurm/config.yaml):
+#   snakemake --profile slurm --configfile config.yaml
+
+# ── Default resources applied to every rule ──────────────────────────────────
+__default__:
+  account:    "YOUR_SLURM_ACCOUNT"     # <-- replace: e.g. biswaslab
+  partition:  "YOUR_PARTITION"          # <-- replace: e.g. componc_cpu, campus
+  time:       "24:00:00"
+  mem:        "32G"
+
+# ── QC & Trimming ─────────────────────────────────────────────────────────────
+fastp_trim:
+  time:       "04:00:00"
+  mem:        "16G"
+  # 4 threads set in Snakefile rule
+
+# ── Alignment (STAR is the main memory consumer) ─────────────────────────────
+star_align:
+  time:       "08:00:00"
+  mem:        "64G"
+  # STAR 2-pass needs ~32 GB index + BAM sort RAM (limitBAMsortRAM 32G)
+
+index_bam:
+  time:       "01:00:00"
+  mem:        "4G"
+
+# ── Editing Site Calling (most CPU/memory intensive step) ────────────────────
+call_editing_sites:
+  partition:  "bigmem"                  # <-- adjust if your HPC has a bigmem queue
+  time:       "48:00:00"
+  mem:        "128G"
+  # Uses calling_threads cores (set in config.yaml, default 16)
+
+# ── Filtering & Annotation ───────────────────────────────────────────────────
+filter_replicates:
+  time:       "02:00:00"
+  mem:        "16G"
+
+annotate_genes:
+  time:       "02:00:00"
+  mem:        "16G"
+
+# ── Gene List Extraction (fast shell commands) ────────────────────────────────
+extract_target_genes:
+  time:       "00:10:00"
+  mem:        "2G"
+
+rank_genes_by_editing:
+  time:       "00:10:00"
+  mem:        "2G"
+
+compile_alignment_stats:
+  time:       "00:10:00"
+  mem:        "2G"
+
+# ── Visualisation ─────────────────────────────────────────────────────────────
+plot_editing_frequency_distribution:
+  time:       "00:30:00"
+  mem:        "8G"
+
+plot_chromosome_distribution:
+  time:       "00:30:00"
+  mem:        "8G"
+
+plot_gene_biotype_distribution:
+  time:       "00:30:00"
+  mem:        "8G"
+
+generate_bigwig:
+  time:       "02:00:00"
+  mem:        "16G"
+
+# ── HTML Report ───────────────────────────────────────────────────────────────
+generate_report:
+  time:       "00:30:00"
+  mem:        "8G"

@@ -1,0 +1,76 @@
+# ── Large data files (never commit to git) ────────────────────────────────────
+data/
+trimmed/
+aligned/
+bigwig/
+
+# ── Generated results (reproducible from pipeline) ────────────────────────────
+results/
+qc/
+logs/
+
+# ── Snakemake internal files ──────────────────────────────────────────────────
+.snakemake/
+
+# ── Python cache ──────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+
+# ── Conda / pip environments ──────────────────────────────────────────────────
+hypertribe_env/
+*.egg
+
+# ── Quarto ────────────────────────────────────────────────────────────────────
+.quarto/
+*_files/
+notebooks/.quarto/
+notebooks/*_cache/
+
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ── macOS ─────────────────────────────────────────────────────────────────────
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+
+# ── R ─────────────────────────────────────────────────────────────────────────
+.Rhistory
+.RData
+.Ruserdata
+
+# ── Archives ──────────────────────────────────────────────────────────────────
+*.zip
+*.tar.gz
+*.tgz
+
+# ── Reference genome / annotation (too large for git) ─────────────────────────
+*.fa
+*.fasta
+*.fa.fai
+*.gtf
+*.gff
+*.gff3
+
+# ── BAM / FASTQ (raw / intermediate sequencing data) ─────────────────────────
+*.bam
+*.bai
+*.fastq
+*.fastq.gz
+*.fq
+*.fq.gz
+*.sam
+*.cram
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

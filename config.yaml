@@ -1,0 +1,259 @@
+# HyperTRIBE Analysis Configuration File
+# ========================================
+# 
+# This file contains all parameters for the HyperTRIBE analysis pipeline.
+# Edit this file to customize your analysis.
+#
+# For human samples (hg38)
+
+# ============================================================================
+# Project Information
+# ============================================================================
+
+project_name: "HyperTRIBE_Human_RBP_Analysis"
+organism: "Homo sapiens"
+genome_build: "hg38"
+description: "Identification of RBP targets using HyperTRIBE in human cells"
+
+# ============================================================================
+# Sample Information
+# ============================================================================
+
+# List all sample names (without file extensions)
+samples:
+  - "wildtype_rep1"
+  - "wildtype_rep2"
+  - "RBP_HyperTRIBE_rep1"
+  - "RBP_HyperTRIBE_rep2"
+  - "RBP_HyperTRIBE_rep3"
+
+# Control samples (wildtype or gDNA)
+# These should NOT have HyperTRIBE expression
+control_samples:
+  - "wildtype_rep1"
+  - "wildtype_rep2"
+
+# Treatment samples (with HyperTRIBE)
+# These should express RBP-HyperADARcd fusion
+treatment_samples:
+  - "RBP_HyperTRIBE_rep1"
+  - "RBP_HyperTRIBE_rep2"
+  - "RBP_HyperTRIBE_rep3"
+
+# ============================================================================
+# Reference Genome and Annotation Files
+# ============================================================================
+
+# Human genome FASTA file (hg38)
+genome: "/path/to/reference/hg38.fa"
+
+# STAR index directory
+# Must be built with the same STAR version you're using
+star_index: "/path/to/star_index/hg38"
+
+# Gene annotation in GTF format
+# Recommended: GENCODE comprehensive annotation
+annotation: "/path/to/annotation/gencode.v38.annotation.gtf"
+
+# Optional: Known editing sites database (REDIportal)
+# Used to filter out endogenous ADAR editing sites
+rediportal_db: "/path/to/rediportal/TABLE1_hg38.txt"
+
+# ============================================================================
+# Quality Control Parameters
+# ============================================================================
+
+# Minimum read length after trimming
+min_read_length: 50
+
+# Minimum base quality score (Phred scale)
+min_base_quality: 20
+
+# Enable adapter trimming
+adapter_trimming: true
+
+# Minimum mapping quality for reads
+min_mapping_quality: 10
+
+# ============================================================================
+# Alignment Parameters (STAR)
+# ============================================================================
+
+# Number of threads for STAR alignment
+star_threads: 8
+
+# Maximum number of loci a read can map to
+max_multimapping: 10
+
+# Maximum number of mismatches allowed
+max_mismatches: 3
+
+# Maximum intron length (bases)
+# Human: 500,000 bp is recommended
+max_intron_length: 500000
+
+# ============================================================================
+# Editing Site Calling Parameters
+# ============================================================================
+
+# Minimum read coverage at a position
+# Higher values = more stringent, fewer false positives
+# Recommended: 20-30 for human samples
+min_coverage: 20
+
+# Minimum editing frequency (0-1 scale)
+# 0.05 = 5% editing
+# Recommended: 0.05-0.10
+min_edit_freq: 0.05
+
+# Minimum fold change vs control
+# Ratio of treatment editing / control editing
+# Recommended: 2.0-3.0
+edit_fold_change: 2.0
+
+# P-value threshold for statistical significance
+# Fisher's exact test
+p_value_threshold: 0.05
+
+# Minimum number of replicates
+# Site must appear in N out of total treatment replicates
+# Recommended: 2 for 3 replicates, 3 for 4+ replicates
+min_replicates: 2
+
+# ============================================================================
+# Performance Settings
+# ============================================================================
+
+# Number of threads for parallel editing site calling
+# Recommended: Use all available CPU cores
+calling_threads: 16
+
+# Chunk size for parallel processing (base pairs)
+# Genome is divided into chunks of this size
+# Larger = fewer chunks but more memory per chunk
+# Recommended: 10,000,000 (10 Mbp)
+chunk_size: 10000000
+
+# ============================================================================
+# Output Options
+# ============================================================================
+
+# Generate BigWig files for genome browser visualization
+generate_bigwig: true
+
+# Generate analysis plots
+generate_plots: true
+
+# Keep intermediate files
+keep_intermediate: false
+
+# Compress output files
+compress_output: true
+
+# ============================================================================
+# Advanced Parameters (Optional)
+# ============================================================================
+
+# Filter out homopolymer runs
+# Sites in runs of ≥N identical nucleotides are removed
+remove_homopolymers: true
+homopolymer_length: 4
+
+# Filter out known ADAR editing sites
+# Requires rediportal_db to be set
+filter_known_editing: true
+
+# Minimum distance to another editing site (bp)
+# Helps remove clusters of false positives
+min_site_distance: 10
+
+# Strand-specific library
+# Set to true if your RNA-seq is strand-specific
+strand_specific: false
+
+# Remove sites with strand bias
+# Requires strand_specific = true
+remove_strand_bias: false
+strand_bias_pvalue: 0.01
+
+# ============================================================================
+# Annotation Options
+# ============================================================================
+
+# Gene biotypes to include in analysis
+# Leave empty to include all biotypes
+include_biotypes:
+  - "protein_coding"
+  - "lncRNA"
+  - "miRNA"
+  - "snRNA"
+  - "snoRNA"
+  # Add more as needed
+
+# Genomic regions to analyze
+# Options: exon, intron, 5UTR, 3UTR, CDS
+include_regions:
+  - "exon"
+  - "intron"
+  - "5UTR"
+  - "3UTR"
+
+# ============================================================================
+# Reporting Options
+# ============================================================================
+
+# Maximum number of genes to show in plots
+max_genes_plot: 50
+
+# Top N genes to highlight in report
+top_n_genes: 20
+
+# Include sequence logos around editing sites
+generate_sequence_logos: true
+
+# Include GO enrichment analysis
+run_go_enrichment: false
+go_database: "org.Hs.eg.db"  # Human
+
+# ============================================================================
+# Email Notifications (Optional)
+# ============================================================================
+
+# Send email when analysis completes
+send_email: false
+email_address: "your.email@example.com"
+
+# ============================================================================
+# Notes
+# ============================================================================
+
+# Tips for parameter optimization:
+#
+# 1. For RBPs with few targets:
+#    - Lower min_edit_freq to 0.03
+#    - Lower edit_fold_change to 1.5
+#    - Keep min_coverage at 20+
+#
+# 2. For RBPs with many targets:
+#    - Increase min_edit_freq to 0.10
+#    - Increase edit_fold_change to 3.0
+#    - Consider increasing min_coverage to 30
+#
+# 3. For low coverage samples:
+#    - Decrease min_coverage to 10-15
+#    - Increase min_replicates to 3
+#    - Use multiple controls
+#
+# 4. For high background editing:
+#    - Enable filter_known_editing
+#    - Increase edit_fold_change
+#    - Use gDNA control instead of wildtype RNA
+#
+# 5. Performance optimization:
+#    - Increase calling_threads to match CPU cores
+#    - Adjust chunk_size based on memory (larger = faster but more RAM)
+#    - Process multiple samples in parallel
+
+# ============================================================================
+# End of Configuration
+# ============================================================================
