@@ -456,7 +456,7 @@ Original HyperTRIBE software is licensed under BSD License.
 A: Yes! Just provide appropriate genome and annotation. Works for any species.
 
 **Q: What's the minimum number of replicates?**
-A: We recommend 3 treatment replicates and 2 control replicates minimum.
+A: The minimum is **2 treatment replicates and 2 control replicates**, each sequenced to at least **80 million paired-end reads**. At lower depth the `min_coverage` threshold (default 20×) will filter out most sites. For robust target identification 3 treatment replicates are preferred, but 2+2 at 80M reads is the practical floor.
 
 **Q: Can I use gDNA instead of wildtype RNA as control?**
 A: Yes! gDNA is actually preferred to avoid endogenous ADAR editing.
@@ -465,20 +465,19 @@ A: Yes! gDNA is actually preferred to avoid endogenous ADAR editing.
 A: Use `bedtools intersect` to find overlapping peaks.
 
 **Q: Can I run this on cloud (AWS/GCP)?**
-A: Yes! The pipeline is cloud-ready. We provide Docker containers.
+A: Yes — Snakemake supports cloud executors. The SLURM profile in `slurm/` targets HPC but the Snakefile itself is cloud-agnostic.
+
+**Q: The pipeline failed mid-run. Do I have to restart from scratch?**
+A: No. Snakemake tracks completed steps. Re-run `sbatch submit_pipeline.sh` (or re-run with `--rerun-incomplete`) and it will pick up exactly where it stopped.
+
+**Q: How do I check which jobs are running?**
+A: `squeue -u $USER` shows all queued/running SLURM jobs. Snakemake logs go to `logs/slurm/` — tail the controller log for a live summary:
+```bash
+tail -f logs/slurm/snakemake_controller_*.out
+```
 
 ---
 
-## Contact
-
-- **Lead Developer**: [Name]
-- **Lab**: [Lab Name]
-- **Institution**: [Institution]
-- **Email**: contact@example.com
-- **Twitter**: @hypertribe_pipe
-
----
-
-**Last Updated**: 2026-01-28  
+**Last Updated**: 2026-06-02  
 **Pipeline Version**: 2.0.0  
-**Documentation Version**: 2.0
+**Contact**: [GitHub Issues](https://github.com/jeetayu/HyperTRIBE/issues)
