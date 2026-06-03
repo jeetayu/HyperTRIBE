@@ -29,6 +29,11 @@ index_bam:
   mem:        "16G"
 
 # ── PCR Duplicate Removal ────────────────────────────────────────────────────
+# samtools addreplacerg is streaming (O(1) memory); 16 G is plenty
+add_read_groups:
+  time:       "01:00:00"
+  mem:        "16G"
+
 # Picard loads the full BAM into heap; 64 G is comfortable for ~10-20 GB BAMs
 picard_dedup:
   time:       "04:00:00"

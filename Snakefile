@@ -187,6 +187,36 @@ rule index_bam:
     shell:
         "singularity exec --bind {params.bind} {params.sif} samtools index {input} 2> {log}"
 
+rule add_read_groups:
+    """
+    Add @RG header and per-read RG:Z tags required by Picard MarkDuplicates 3.x.
+
+    STAR does not emit read-group tags by default. Picard 3.x throws a
+    NullPointerException if any read lacks an RG tag. This lightweight step
+    stamps every read with a minimal read group (ID + SM) using samtools
+    addreplacerg, which runs in O(n) time without touching alignment data.
+    """
+    input:
+        bam = "aligned/{sample}.Aligned.sortedByCoord.out.bam",
+        bai = "aligned/{sample}.Aligned.sortedByCoord.out.bam.bai"
+    output:
+        bam = temp("aligned/{sample}.rg.bam")
+    params:
+        sif  = SAMTOOLS_SIF,
+        bind = SINGULARITY_BIND
+    threads: 1
+    log: "logs/{sample}_addRG.log"
+    shell:
+        """
+        singularity exec --bind {params.bind} {params.sif} \
+            samtools addreplacerg \
+            -r $'ID:{wildcards.sample}\\tSM:{wildcards.sample}\\tPL:ILLUMINA\\tLB:{wildcards.sample}\\tPU:{wildcards.sample}' \
+            -m overwrite_all \
+            -o {output.bam} \
+            {input.bam} \
+            2> {log}
+        """
+
 rule picard_dedup:
     """
     Remove PCR duplicates with Picard MarkDuplicates.
@@ -197,8 +227,7 @@ rule picard_dedup:
     Uses the pre-built Singularity container (Picard not in conda env).
     """
     input:
-        bam = "aligned/{sample}.Aligned.sortedByCoord.out.bam",
-        bai = "aligned/{sample}.Aligned.sortedByCoord.out.bam.bai"
+        bam = "aligned/{sample}.rg.bam"
     output:
         bam     = "aligned/{sample}.nodup.bam",
         metrics = "aligned/{sample}.dup_metrics.txt"
