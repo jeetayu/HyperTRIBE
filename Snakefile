@@ -294,7 +294,7 @@ rule multiqc:
         dup_metrics   = expand("aligned/{sample}.dup_metrics.txt", sample=LOCAL_SAMPLES)
     output:
         html = "qc/multiqc_report.html",
-        data = directory("qc/multiqc_data")
+        data = directory("qc/multiqc_report_data")
     params:
         multiqc_sif = MULTIQC_SIF,
         bind        = SINGULARITY_BIND
