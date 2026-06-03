@@ -8,74 +8,88 @@
 
 # ── Default resources applied to every rule ──────────────────────────────────
 __default__:
-  account:    "YOUR_SLURM_ACCOUNT"     # <-- replace: e.g. biswaslab
-  partition:  "YOUR_PARTITION"          # <-- replace: e.g. componc_cpu, campus
+  account:    "abdelwao"
+  partition:  "cpu"
   time:       "24:00:00"
-  mem:        "32G"
+  mem:        "64G"             # floor for all rules; enough for any single-sample step
 
 # ── QC & Trimming ─────────────────────────────────────────────────────────────
-fastp_trim:
+cutadapt_trim:
   time:       "04:00:00"
-  mem:        "16G"
-  # 4 threads set in Snakefile rule
+  mem:        "64G"
 
-# ── Alignment (STAR is the main memory consumer) ─────────────────────────────
+# ── Alignment ────────────────────────────────────────────────────────────────
+# hg38 STAR index ~28 GB + limitBAMsortRAM 48 GB = ~76 GB peak; 96 G gives headroom
 star_align:
   time:       "08:00:00"
-  mem:        "64G"
-  # STAR 2-pass needs ~32 GB index + BAM sort RAM (limitBAMsortRAM 32G)
+  mem:        "96G"
 
 index_bam:
   time:       "01:00:00"
-  mem:        "4G"
+  mem:        "16G"
+
+# ── PCR Duplicate Removal ────────────────────────────────────────────────────
+# Picard loads the full BAM into heap; 64 G is comfortable for ~10-20 GB BAMs
+picard_dedup:
+  time:       "04:00:00"
+  mem:        "64G"
+
+index_dedup_bam:
+  time:       "01:00:00"
+  mem:        "16G"
+
+# ── MultiQC ───────────────────────────────────────────────────────────────────
+multiqc:
+  time:       "01:00:00"
+  mem:        "32G"
 
 # ── Editing Site Calling (most CPU/memory intensive step) ────────────────────
+# Loads all control + treatment BAMs simultaneously across parallel genome chunks
 call_editing_sites:
-  partition:  "bigmem"                  # <-- adjust if your HPC has a bigmem queue
+  partition:  "cpu_highmem"
   time:       "48:00:00"
-  mem:        "128G"
-  # Uses calling_threads cores (set in config.yaml, default 16)
+  mem:        "256G"
 
 # ── Filtering & Annotation ───────────────────────────────────────────────────
 filter_replicates:
   time:       "02:00:00"
-  mem:        "16G"
+  mem:        "64G"
 
 annotate_genes:
   time:       "02:00:00"
-  mem:        "16G"
+  mem:        "64G"
 
-# ── Gene List Extraction (fast shell commands) ────────────────────────────────
+# ── Gene List Extraction ──────────────────────────────────────────────────────
 extract_target_genes:
   time:       "00:10:00"
-  mem:        "2G"
+  mem:        "16G"
 
 rank_genes_by_editing:
   time:       "00:10:00"
-  mem:        "2G"
+  mem:        "16G"
 
 compile_alignment_stats:
   time:       "00:10:00"
-  mem:        "2G"
+  mem:        "16G"
 
 # ── Visualisation ─────────────────────────────────────────────────────────────
 plot_editing_frequency_distribution:
   time:       "00:30:00"
-  mem:        "8G"
+  mem:        "32G"
 
 plot_chromosome_distribution:
   time:       "00:30:00"
-  mem:        "8G"
+  mem:        "32G"
 
 plot_gene_biotype_distribution:
   time:       "00:30:00"
-  mem:        "8G"
+  mem:        "32G"
 
 generate_bigwig:
   time:       "02:00:00"
-  mem:        "16G"
+  mem:        "64G"
 
 # ── HTML Report ───────────────────────────────────────────────────────────────
 generate_report:
   time:       "00:30:00"
-  mem:        "8G"
+  mem:        "32G"

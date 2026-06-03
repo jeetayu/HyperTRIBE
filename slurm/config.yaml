@@ -23,8 +23,9 @@ cluster: >-
   --error=logs/slurm/{rule}_%j.err
   --parsable
 
-# Path to per-rule resource overrides (relative to Snakefile location)
-cluster-config: "slurm/cluster.yaml"
+# Absolute path — cluster-config is resolved from the working directory at
+# snakemake invocation, not from the profile directory, so must be absolute.
+cluster-config: "/data1/abdelwao/jeet/Bolton/HyperTRIBE/slurm/cluster.yaml"
 
 # ── Job control ────────────────────────────────────────────────────────────────
 # Maximum number of jobs submitted to the queue simultaneously

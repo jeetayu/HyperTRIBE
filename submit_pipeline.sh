@@ -19,15 +19,15 @@
 # =============================================================================
 
 #SBATCH --job-name=ht_controller
-#SBATCH --account=YOUR_SLURM_ACCOUNT          # <-- replace
-#SBATCH --partition=YOUR_PARTITION            # <-- replace (use a short/interactive queue)
-#SBATCH --time=96:00:00                       # controller can run up to 4 days
-#SBATCH --mem=4G                              # controller only needs minimal RAM
+#SBATCH --account=abdelwao
+#SBATCH --partition=cpu
+#SBATCH --time=96:00:00
+#SBATCH --mem=4G
 #SBATCH --cpus-per-task=1
 #SBATCH --output=logs/slurm/snakemake_controller_%j.out
 #SBATCH --error=logs/slurm/snakemake_controller_%j.err
 #SBATCH --mail-type=BEGIN,END,FAIL
-#SBATCH --mail-user=jbiswas@gmail.com         # <-- your email
+#SBATCH --mail-user=biswasj@mskcc.org
 
 set -euo pipefail
 

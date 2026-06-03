@@ -15,6 +15,16 @@ PIPELINE_DIR  = workflow.basedir
 SCRIPTS_DIR   = os.path.join(PIPELINE_DIR, "scripts")
 NOTEBOOKS_DIR = os.path.join(PIPELINE_DIR, "notebooks")
 
+# Singularity containers — all bioinformatics tools run via Singularity
+CUTADAPT_SIF  = "/data1/abdelwao/shared/containers/cutadapt_latest.sif"
+STAR_SIF      = "/data1/abdelwao/shared/containers/star_2.7.10a_alpha_220506.sif"
+SAMTOOLS_SIF  = "/data1/abdelwao/shared/containers/samtools_latest.sif"
+BEDTOOLS_SIF  = "/data1/abdelwao/shared/containers/bedtools_v2.27.1dfsg-4-deb_cv1.sif"
+DEEPTOOLS_SIF = "/data1/abdelwao/shared/containers/deeptools_latest.sif"
+PICARD_SIF    = "/data1/abdelwao/shared/containers/picard_3.4.0.sif"
+MULTIQC_SIF   = "/data1/abdelwao/shared/containers/multiqc_latest.sif"
+SINGULARITY_BIND = "/data1/abdelwao:/data1/abdelwao"
+
 # ============================================================================
 # Configuration
 # ============================================================================
@@ -38,10 +48,12 @@ ALL_SAMPLES = CONTROL_SAMPLES + TREATMENT_SAMPLES
 
 rule all:
     input:
-        # QC reports
-        expand("qc/{sample}_fastp.html", sample=ALL_SAMPLES),
-        # Alignments
-        expand("aligned/{sample}.Aligned.sortedByCoord.out.bam.bai", sample=ALL_SAMPLES),
+        # Per-sample cutadapt QC logs (parsed by MultiQC)
+        expand("qc/{sample}_cutadapt.txt", sample=ALL_SAMPLES),
+        # Deduplicated + indexed alignments (input to editing caller)
+        expand("aligned/{sample}.nodup.bam.bai", sample=ALL_SAMPLES),
+        # MultiQC report (cutadapt + STAR + Picard all in one)
+        "qc/multiqc_report.html",
         # Editing sites
         "results/raw_editing_sites.bed",
         "results/filtered_editing_sites.bed",
@@ -61,41 +73,44 @@ rule all:
 # Quality Control and Trimming
 # ============================================================================
 
-rule fastp_trim:
+rule cutadapt_trim:
     """
-    Trim adapters and low-quality bases using fastp.
-    
-    fastp is faster than Trimmomatic and provides comprehensive QC.
-    Removes 6bp from 5' end to avoid random hexamer priming artifacts.
+    Trim adapters and low-quality bases using cutadapt via Singularity.
+
+    Matches the parameters used in validated HyperTRIBE scripts:
+      -q 20        : trim low-quality bases from 3' end
+      -u 6         : remove 6bp from 5' end of R1 (random hexamer artifact)
+      -U 6         : remove 6bp from 5' end of R2
+      --trim-n     : remove flanking N bases
+      --minimum-length 25 : discard reads shorter than 25 bp after trimming
+    MultiQC recognises cutadapt's stdout report format directly.
     """
     input:
         r1 = "data/fastq/{sample}_R1.fastq.gz",
         r2 = "data/fastq/{sample}_R2.fastq.gz"
     output:
-        r1 = "trimmed/{sample}_R1_trimmed.fastq.gz",
-        r2 = "trimmed/{sample}_R2_trimmed.fastq.gz",
-        html = "qc/{sample}_fastp.html",
-        json = "qc/{sample}_fastp.json"
+        r1  = "trimmed/{sample}_R1_trimmed.fastq.gz",
+        r2  = "trimmed/{sample}_R2_trimmed.fastq.gz",
+        log = "qc/{sample}_cutadapt.txt"
     params:
-        min_length = config.get("min_read_length", 50),
+        min_length  = config.get("min_read_length", 25),
         min_quality = config.get("min_base_quality", 20),
-        trim_front = 6  # Remove 6bp from 5' end
+        sif  = CUTADAPT_SIF,
+        bind = SINGULARITY_BIND
     threads: 4
-    log: "logs/{sample}_fastp.log"
+    log: "logs/{sample}_cutadapt.log"
     shell:
         """
-        fastp \
-            -i {input.r1} -I {input.r2} \
-            -o {output.r1} -O {output.r2} \
-            --thread {threads} \
-            --html {output.html} \
-            --json {output.json} \
-            --qualified_quality_phred {params.min_quality} \
-            --length_required {params.min_length} \
-            --trim_front1 {params.trim_front} \
-            --trim_front2 {params.trim_front} \
-            --detect_adapter_for_pe \
-            2> {log}
+        singularity exec --bind {params.bind} {params.sif} \
+            cutadapt \
+            -q {params.min_quality} \
+            -u 6 -U 6 \
+            --trim-n \
+            --minimum-length {params.min_length} \
+            -j {threads} \
+            -o {output.r1} -p {output.r2} \
+            {input.r1} {input.r2} \
+            > {output.log} 2> {log}
         """
 
 # ============================================================================
@@ -104,10 +119,15 @@ rule fastp_trim:
 
 rule star_align:
     """
-    Align reads to human transcriptome using STAR.
-    
-    Uses 2-pass mode for better splice junction detection.
-    Optimized parameters for human RNA-seq.
+    Align reads to human genome using STAR with HyperTRIBE-specific parameters.
+
+    Key HyperTRIBE requirements:
+      - Only uniquely mapping reads (outFilterMultimapNmax 1) to avoid
+        multi-mappers inflating A→G counts at repetitive loci
+      - Fraction-based mismatch filter (outFilterMismatchNoverLmax 0.06)
+        rather than absolute count, which is better for variable read lengths
+      - Strict splice-junction filters to reduce spurious editing calls
+        at non-canonical junctions
     """
     input:
         r1 = "trimmed/{sample}_R1_trimmed.fastq.gz",
@@ -119,15 +139,16 @@ rule star_align:
         log_out = "aligned/{sample}.Log.out",
         sj = "aligned/{sample}.SJ.out.tab"
     params:
-        index = STAR_INDEX,
-        prefix = "aligned/{sample}.",
-        max_multimap = config.get("max_multimapping", 10),
-        max_mismatch = config.get("max_mismatches", 3),
-        max_intron = config.get("max_intron_length", 500000)
+        index      = STAR_INDEX,
+        prefix     = "aligned/{sample}.",
+        max_intron = config.get("max_intron_length", 500000),
+        sif        = STAR_SIF,
+        bind       = SINGULARITY_BIND
     threads: config.get("star_threads", 8)
     log: "logs/{sample}_star.log"
     shell:
         """
+        singularity exec --bind {params.bind} {params.sif} \
         STAR \
             --runThreadN {threads} \
             --genomeDir {params.index} \
@@ -136,25 +157,125 @@ rule star_align:
             --outFileNamePrefix {params.prefix} \
             --outSAMtype BAM SortedByCoordinate \
             --outSAMattributes All \
-            --outFilterMultimapNmax {params.max_multimap} \
-            --outFilterMismatchNmax {params.max_mismatch} \
-            --alignIntronMax {params.max_intron} \
-            --limitBAMsortRAM 32000000000 \
-            --outSAMstrandField intronMotif \
             --twopassMode Basic \
+            --quantMode GeneCounts \
+            --outFilterMultimapNmax 1 \
+            --outFilterMismatchNoverLmax 0.06 \
+            --outFilterScoreMinOverLread 0.3 \
+            --outFilterMatchNminOverLread 0.3 \
+            --outFilterMatchNmin 15 \
+            --outSJfilterReads Unique \
+            --outSAMstrandField intronMotif \
+            --outFilterIntronMotifs RemoveNoncanonical \
+            --alignMatesGapMax 25000 \
+            --alignIntronMax {params.max_intron} \
+            --limitBAMsortRAM 48000000000 \
             2> {log}
         """
 
 rule index_bam:
-    """Index BAM files for rapid random access"""
+    """Index initial BAM for Picard input"""
     input:
         "aligned/{sample}.Aligned.sortedByCoord.out.bam"
     output:
         "aligned/{sample}.Aligned.sortedByCoord.out.bam.bai"
+    params:
+        sif  = SAMTOOLS_SIF,
+        bind = SINGULARITY_BIND
     threads: 1
     log: "logs/{sample}_index.log"
     shell:
-        "samtools index {input} 2> {log}"
+        "singularity exec --bind {params.bind} {params.sif} samtools index {input} 2> {log}"
+
+rule picard_dedup:
+    """
+    Remove PCR duplicates with Picard MarkDuplicates.
+
+    Critical for HyperTRIBE: PCR duplicates amplify editing signals from
+    single molecules, creating false-positive high-frequency edit sites.
+    Removing them ensures each A→G call represents an independent RNA molecule.
+    Uses the pre-built Singularity container (Picard not in conda env).
+    """
+    input:
+        bam = "aligned/{sample}.Aligned.sortedByCoord.out.bam",
+        bai = "aligned/{sample}.Aligned.sortedByCoord.out.bam.bai"
+    output:
+        bam     = "aligned/{sample}.nodup.bam",
+        metrics = "aligned/{sample}.dup_metrics.txt"
+    params:
+        picard_sif = PICARD_SIF,
+        bind       = SINGULARITY_BIND,
+        tmp        = "tmp"
+    log: "logs/{sample}_dedup.log"
+    shell:
+        """
+        mkdir -p {params.tmp}
+        singularity exec --bind {params.bind} {params.picard_sif} \
+            java -jar /usr/picard/picard.jar MarkDuplicates \
+            INPUT={input.bam} \
+            OUTPUT={output.bam} \
+            METRICS_FILE={output.metrics} \
+            VALIDATION_STRINGENCY=LENIENT \
+            REMOVE_DUPLICATES=true \
+            TMP_DIR={params.tmp} \
+            ASSUME_SORTED=true \
+            2> {log}
+        """
+
+rule index_dedup_bam:
+    """Index deduplicated BAM — this is the final BAM used for all downstream steps"""
+    input:
+        "aligned/{sample}.nodup.bam"
+    output:
+        "aligned/{sample}.nodup.bam.bai"
+    params:
+        sif  = SAMTOOLS_SIF,
+        bind = SINGULARITY_BIND
+    threads: 1
+    log: "logs/{sample}_index_dedup.log"
+    shell:
+        "singularity exec --bind {params.bind} {params.sif} samtools index {input} 2> {log}"
+
+# ============================================================================
+# MultiQC — aggregate QC across all samples
+# ============================================================================
+
+rule multiqc:
+    """
+    Aggregate cutadapt trimming stats, STAR alignment stats, and Picard duplicate
+    metrics into a single MultiQC HTML report.
+
+    Inputs are all collected before this rule fires so the report always covers
+    every sample. Uses the pre-built Singularity container.
+
+    Key sections in the report:
+      cutadapt → read quality, adapter content, 6-bp 5'-trim effect
+      STAR     → uniquely mapped %, multimapper %, unmapped reads
+      Picard   → duplication rate per sample (critical QC for HyperTRIBE)
+    """
+    input:
+        cutadapt_logs = expand("qc/{sample}_cutadapt.txt", sample=ALL_SAMPLES),
+        star_logs     = expand("aligned/{sample}.Log.final.out", sample=ALL_SAMPLES),
+        dup_metrics   = expand("aligned/{sample}.dup_metrics.txt", sample=ALL_SAMPLES)
+    output:
+        html = "qc/multiqc_report.html",
+        data = directory("qc/multiqc_data")
+    params:
+        multiqc_sif = MULTIQC_SIF,
+        bind        = SINGULARITY_BIND
+    log: "logs/multiqc.log"
+    shell:
+        """
+        singularity exec --bind {params.bind} {params.multiqc_sif} \
+            multiqc \
+            qc/ \
+            aligned/ \
+            --outdir qc/ \
+            --filename multiqc_report.html \
+            --force \
+            --title "HyperTRIBE QC Report" \
+            2> {log}
+        """
 
 # ============================================================================
 # Editing Site Calling
@@ -163,18 +284,18 @@ rule index_bam:
 rule call_editing_sites:
     """
     Call RNA editing sites using optimized parallel algorithm.
-    
+
     This replaces the MySQL-based approach with direct BAM processing.
-    Dramatically faster and more memory efficient.
+    Inputs are deduplicated BAMs from picard_dedup.
     """
     input:
-        control = expand("aligned/{sample}.Aligned.sortedByCoord.out.bam", 
+        control = expand("aligned/{sample}.nodup.bam",
                         sample=CONTROL_SAMPLES),
-        control_idx = expand("aligned/{sample}.Aligned.sortedByCoord.out.bam.bai",
+        control_idx = expand("aligned/{sample}.nodup.bam.bai",
                             sample=CONTROL_SAMPLES),
-        treatment = expand("aligned/{sample}.Aligned.sortedByCoord.out.bam",
+        treatment = expand("aligned/{sample}.nodup.bam",
                           sample=TREATMENT_SAMPLES),
-        treatment_idx = expand("aligned/{sample}.Aligned.sortedByCoord.out.bam.bai",
+        treatment_idx = expand("aligned/{sample}.nodup.bam.bai",
                               sample=TREATMENT_SAMPLES)
     output:
         "results/raw_editing_sites.bed"
@@ -373,7 +494,7 @@ rule generate_report:
     input:
         editing_sites  = "results/annotated_editing_sites.bed",
         alignment_stats = "results/alignment_stats.txt",
-        fastp_jsons    = expand("qc/{sample}_fastp.json", sample=ALL_SAMPLES),
+        cutadapt_logs  = expand("qc/{sample}_cutadapt.txt", sample=ALL_SAMPLES),
         gene_list      = "results/target_genes.txt",
         gene_ranks     = "results/target_genes_by_editcount.txt",
         plots = [
@@ -403,21 +524,22 @@ rule generate_report:
 # ============================================================================
 
 rule generate_bigwig:
-    """
-    Generate BigWig files for genome browser visualization.
-    
-    Optional - only runs if enabled in config.
-    """
+    """Generate BigWig files for genome browser visualization (uses deduped BAM)."""
     input:
-        "aligned/{sample}.Aligned.sortedByCoord.out.bam"
+        bam = "aligned/{sample}.nodup.bam",
+        bai = "aligned/{sample}.nodup.bam.bai"
     output:
         "bigwig/{sample}.bw"
+    params:
+        sif  = DEEPTOOLS_SIF,
+        bind = SINGULARITY_BIND
     threads: 4
     log: "logs/{sample}_bigwig.log"
     shell:
         """
-        bamCoverage \
-            -b {input} \
+        singularity exec --bind {params.bind} {params.sif} \
+            bamCoverage \
+            -b {input.bam} \
             -o {output} \
             --binSize 10 \
             --normalizeUsing CPM \
