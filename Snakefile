@@ -42,6 +42,12 @@ ANNOTATION = config["annotation"]
 # All samples combined
 ALL_SAMPLES = CONTROL_SAMPLES + TREATMENT_SAMPLES
 
+# If control_dir is set in config, controls are already trimmed/aligned/deduped
+# in that shared directory. Only treatment samples need local processing.
+# Defaults to "aligned" (local) for backward compatibility.
+CONTROL_DIR = config.get("control_dir", "aligned")
+LOCAL_SAMPLES = TREATMENT_SAMPLES if CONTROL_DIR != "aligned" else ALL_SAMPLES
+
 # ============================================================================
 # Rule: all - Define final outputs
 # ============================================================================
@@ -49,9 +55,9 @@ ALL_SAMPLES = CONTROL_SAMPLES + TREATMENT_SAMPLES
 rule all:
     input:
         # Per-sample cutadapt QC logs (parsed by MultiQC)
-        expand("qc/{sample}_cutadapt.txt", sample=ALL_SAMPLES),
+        expand("qc/{sample}_cutadapt.txt", sample=LOCAL_SAMPLES),
         # Deduplicated + indexed alignments (input to editing caller)
-        expand("aligned/{sample}.nodup.bam.bai", sample=ALL_SAMPLES),
+        expand("aligned/{sample}.nodup.bam.bai", sample=LOCAL_SAMPLES),
         # MultiQC report (cutadapt + STAR + Picard all in one)
         "qc/multiqc_report.html",
         # Editing sites
@@ -283,9 +289,9 @@ rule multiqc:
       Picard   → duplication rate per sample (critical QC for HyperTRIBE)
     """
     input:
-        cutadapt_logs = expand("qc/{sample}_cutadapt.txt", sample=ALL_SAMPLES),
-        star_logs     = expand("aligned/{sample}.Log.final.out", sample=ALL_SAMPLES),
-        dup_metrics   = expand("aligned/{sample}.dup_metrics.txt", sample=ALL_SAMPLES)
+        cutadapt_logs = expand("qc/{sample}_cutadapt.txt", sample=LOCAL_SAMPLES),
+        star_logs     = expand("aligned/{sample}.Log.final.out", sample=LOCAL_SAMPLES),
+        dup_metrics   = expand("aligned/{sample}.dup_metrics.txt", sample=LOCAL_SAMPLES)
     output:
         html = "qc/multiqc_report.html",
         data = directory("qc/multiqc_data")
@@ -318,9 +324,9 @@ rule call_editing_sites:
     Inputs are deduplicated BAMs from picard_dedup.
     """
     input:
-        control = expand("aligned/{sample}.nodup.bam",
+        control = expand(CONTROL_DIR + "/{sample}.nodup.bam",
                         sample=CONTROL_SAMPLES),
-        control_idx = expand("aligned/{sample}.nodup.bam.bai",
+        control_idx = expand(CONTROL_DIR + "/{sample}.nodup.bam.bai",
                             sample=CONTROL_SAMPLES),
         treatment = expand("aligned/{sample}.nodup.bam",
                           sample=TREATMENT_SAMPLES),
@@ -442,7 +448,7 @@ rule rank_genes_by_editing:
 rule compile_alignment_stats:
     """Compile alignment statistics from all samples"""
     input:
-        expand("aligned/{sample}.Log.final.out", sample=ALL_SAMPLES)
+        expand("aligned/{sample}.Log.final.out", sample=LOCAL_SAMPLES)
     output:
         "results/alignment_stats.txt"
     shell:
@@ -523,7 +529,7 @@ rule generate_report:
     input:
         editing_sites  = "results/annotated_editing_sites.bed",
         alignment_stats = "results/alignment_stats.txt",
-        cutadapt_logs  = expand("qc/{sample}_cutadapt.txt", sample=ALL_SAMPLES),
+        cutadapt_logs  = expand("qc/{sample}_cutadapt.txt", sample=LOCAL_SAMPLES),
         gene_list      = "results/target_genes.txt",
         gene_ranks     = "results/target_genes_by_editcount.txt",
         plots = [

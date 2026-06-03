@@ -40,6 +40,22 @@ treatment_samples:
   - "RBP_HyperTRIBE_rep2"
   - "RBP_HyperTRIBE_rep3"
 
+# Optional: shared control directory
+# If multiple experiments share the same control (e.g. cherry-NLS), process
+# controls once in a dedicated directory and point all experiments here.
+# The pipeline will skip trimming/alignment/dedup for control_samples and
+# instead look for their .nodup.bam files at this path.
+#
+# Example (multiple RBP experiments sharing the same cherry-NLS controls):
+#   analysis/
+#   ├── control/aligned/   ← cherry-nls-{1,2}.nodup.bam live here
+#   ├── dhx15/             ← control_dir: ../control/aligned
+#   ├── puf60_wt/          ← control_dir: ../control/aligned
+#   └── puf60_s161/        ← control_dir: ../control/aligned
+#
+# Leave commented out (or omit) to process controls locally (default).
+# control_dir: "/path/to/shared/control/aligned"
+
 # ============================================================================
 # Reference Genome and Annotation Files
 # ============================================================================
