@@ -26,22 +26,27 @@ logger = logging.getLogger(__name__)
 BIOTYPE_PRIORITY = {
     'protein_coding': 100,
     'lncRNA': 50,
+    'lincRNA': 50,          # GENCODE uses lincRNA
     'miRNA': 45,
     'snRNA': 40,
     'snoRNA': 40,
     'scRNA': 35,
     'rRNA': 30,
     'misc_RNA': 20,
-    'ribozyme': 15,
-    'sRNA': 15,
-    'scaRNA': 15,
+    'processed_transcript': 15,
+    'sense_intronic': 12,
+    'antisense': 12,
+    'ribozyme': 10,
+    'sRNA': 10,
+    'scaRNA': 10,
     'ncRNA': 10,
-    'antisense': 10,
+    'TEC': 8,
     'pseudogene': 5,
     'processed_pseudogene': 4,
     'unprocessed_pseudogene': 3,
-    'transcribed_pseudogene': 3,
-    'Metazoa_SRP': 1,  # Generic ncRNA - LOWEST priority
+    'transcribed_unprocessed_pseudogene': 3,
+    'transcribed_processed_pseudogene': 3,
+    'Metazoa_SRP': 1,
     'Mt_tRNA': 1,
     'Mt_rRNA': 1,
 }
@@ -54,46 +59,80 @@ class GTFParser:
         self.gtf_file = gtf_file
         self.genes = defaultdict(list)  # chromosome -> list of gene intervals
         
+    @staticmethod
+    def _infer_gene_type(attributes: Dict[str, str]) -> str:
+        """
+        Extract gene_type from GTF attributes.
+        GENCODE/Ensembl GTFs carry gene_type or gene_biotype directly.
+        UCSC iGenomes GTFs lack this field — infer from transcript_id prefix:
+          NM_/XM_ = protein_coding,  NR_/XR_ = ncRNA.
+        """
+        gene_type = attributes.get('gene_type', attributes.get('gene_biotype', ''))
+        if gene_type:
+            return gene_type
+        transcript_id = attributes.get('transcript_id', '')
+        if transcript_id.startswith(('NM_', 'XM_')):
+            return 'protein_coding'
+        if transcript_id.startswith(('NR_', 'XR_')):
+            return 'ncRNA'
+        return '.'
+
     def parse(self):
-        """Parse GTF file and build interval tree"""
+        """
+        Parse GTF file and build gene-level intervals.
+
+        Handles two GTF flavours:
+        - GENCODE/Ensembl: explicit 'gene' feature records with gene_type.
+        - UCSC iGenomes:   only 'exon' records; gene intervals are reconstructed
+                           by merging all exons per gene_id (min start, max end).
+        """
         logger.info(f"Parsing GTF file: {self.gtf_file}")
-        
-        gene_count = 0
+
+        # key: (chrom, gene_id) -> gene_info dict (extended as we see more exons)
+        gene_map: Dict[Tuple[str, str], dict] = {}
+
         with open(self.gtf_file, 'r') as f:
             for line in f:
                 if line.startswith('#'):
                     continue
-                
+
                 fields = line.strip().split('\t')
                 if len(fields) < 9:
                     continue
-                
-                feature_type = fields[2]
-                if feature_type != 'gene':
-                    continue
-                
-                chrom = fields[0]
-                start = int(fields[3])
-                end = int(fields[4])
+
+                chrom  = fields[0]
+                start  = int(fields[3])
+                end    = int(fields[4])
                 strand = fields[6]
-                
-                # Parse attributes
+
                 attributes = self.parse_attributes(fields[8])
-                
-                gene_info = {
-                    'start': start,
-                    'end': end,
-                    'strand': strand,
-                    'gene_name': attributes.get('gene_name', '.'),
-                    'gene_id': attributes.get('gene_id', '.'),
-                    'gene_type': attributes.get('gene_type', attributes.get('gene_biotype', '.')),
-                }
-                
-                self.genes[chrom].append(gene_info)
-                gene_count += 1
-        
+                gene_id   = attributes.get('gene_id', '')
+                gene_name = attributes.get('gene_name', gene_id)
+                if not gene_id:
+                    continue
+
+                key = (chrom, gene_id)
+                if key not in gene_map:
+                    gene_map[key] = {
+                        'start':     start,
+                        'end':       end,
+                        'strand':    strand,
+                        'gene_name': gene_name,
+                        'gene_id':   gene_id,
+                        'gene_type': self._infer_gene_type(attributes),
+                    }
+                else:
+                    # Extend the gene span to cover all its features (exons, CDS, etc.)
+                    gene_map[key]['start'] = min(gene_map[key]['start'], start)
+                    gene_map[key]['end']   = max(gene_map[key]['end'],   end)
+
+        # Load into per-chromosome lists
+        for (chrom, _), gene_info in gene_map.items():
+            self.genes[chrom].append(gene_info)
+
+        gene_count = sum(len(v) for v in self.genes.values())
         logger.info(f"Parsed {gene_count} genes")
-        
+
         # Sort genes by start position for each chromosome
         for chrom in self.genes:
             self.genes[chrom].sort(key=lambda x: x['start'])

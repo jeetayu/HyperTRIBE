@@ -64,6 +64,7 @@ rule all:
         "results/raw_editing_sites.bed",
         "results/filtered_editing_sites.bed",
         "results/annotated_editing_sites.bed",
+        "results/splice_annotated_editing_sites.bed",
         # Gene lists
         "results/target_genes.txt",
         "results/target_genes_by_editcount.txt",
@@ -406,6 +407,37 @@ rule annotate_genes:
             2> {log}
         """
 
+rule annotate_splice_sites:
+    """
+    Classify each editing site relative to exon/intron boundaries and
+    annotate proximity to 5' splice site (donor), 3' splice site (acceptor),
+    and the polypyrimidine tract.
+
+    Adds four columns to the gene-annotated BED:
+      feature_type  : CDS_exon | UTR | intron | intergenic
+      dist_5ss      : nt from donor splice site (NA if not intronic)
+      dist_3ss      : nt from acceptor splice site (NA if not intronic)
+      splice_region : 5ss_proximal | 3ss_proximal | ppt_region | deep_intronic
+                      | CDS_exon | UTR | intergenic
+
+    Especially informative for splicing-factor RBPs (e.g. PUF60, DHX15)
+    where intronic editing near splice elements is biologically meaningful.
+    """
+    input:
+        editing_sites = "results/annotated_editing_sites.bed",
+        gtf = ANNOTATION
+    output:
+        "results/splice_annotated_editing_sites.bed"
+    log: "logs/annotate_splice_sites.log"
+    shell:
+        """
+        python {SCRIPTS_DIR}/annotate_splice_sites.py \
+            --editing-sites {input.editing_sites} \
+            --gtf           {input.gtf} \
+            --output        {output} \
+            2> {log}
+        """
+
 # ============================================================================
 # Extract Target Genes
 # ============================================================================
@@ -520,11 +552,11 @@ rule plot_gene_biotype_distribution:
 
 rule generate_report:
     """
-    Render the Quarto HTML report with all pipeline results.
+    Generate HTML summary report using the Python fallback script.
 
-    Quarto executes the notebook in the analysis working directory so that
-    relative paths (results/, qc/, config.yaml) resolve correctly.
-    The output is a self-contained HTML file with embedded figures.
+    Uses scripts/generate_report.py instead of Quarto, since Quarto is not
+    installed on the cluster nodes. The script produces a self-contained HTML
+    report with alignment QC, editing site statistics, and gene target tables.
     """
     input:
         editing_sites  = "results/annotated_editing_sites.bed",
@@ -537,20 +569,19 @@ rule generate_report:
             "results/plots/chromosome_distribution.pdf",
             "results/plots/gene_biotype_distribution.pdf",
         ],
-        notebook = os.path.join(NOTEBOOKS_DIR, "hypertribe_report.qmd"),
     output:
         "results/analysis_report.html"
     params:
-        outdir   = lambda wc, output: str(Path(output[0]).parent.resolve()),
-        execdir  = lambda wc: str(Path.cwd()),
-        notebook = os.path.join(NOTEBOOKS_DIR, "hypertribe_report.qmd"),
+        script = os.path.join(workflow.basedir, "scripts", "generate_report.py"),
     log: "logs/generate_report.log"
     shell:
         """
-        quarto render {params.notebook} \
-            --execute-dir {params.execdir} \
-            --output-dir  {params.outdir} \
-            --output      analysis_report.html \
+        python {params.script} \
+            --editing-sites   {input.editing_sites} \
+            --alignment-stats {input.alignment_stats} \
+            --gene-list       {input.gene_list} \
+            --gene-ranks      {input.gene_ranks} \
+            --output          {output} \
             2> {log}
         """
 

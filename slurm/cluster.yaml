@@ -52,7 +52,7 @@ multiqc:
 # Loads all control + treatment BAMs simultaneously across parallel genome chunks
 call_editing_sites:
   partition:  "cpu_highmem"
-  time:       "48:00:00"
+  time:       "72:00:00"
   mem:        "256G"
 
 # ── Filtering & Annotation ───────────────────────────────────────────────────

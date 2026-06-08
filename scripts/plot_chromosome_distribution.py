@@ -59,7 +59,7 @@ _BASE_COLS = [
     'chr', 'start', 'end', 'gene', 'edit_freq', 'strand',
     'control_cov', 'control_A', 'control_G',
     'treatment_cov', 'treatment_A', 'treatment_G',
-    'fold_change', 'p_value',
+    'fold_change', 'p_value', 'n_replicates',
     'gene_id', 'gene_type',
 ]
 
