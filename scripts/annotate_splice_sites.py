@@ -147,7 +147,7 @@ class SpliceSiteAnnotator:
         pos_0based: int,
         gene_id: str,
         strand: str,
-    ) -> Tuple[str, Optional[int], Optional[int], str]:
+    ) -> Tuple[str, Optional[int], Optional[int], str, Optional[int], Optional[int]]:
         """
         Classify one editing site.
 
@@ -155,37 +155,64 @@ class SpliceSiteAnnotator:
         ----------
         chrom      : chromosome (must match GTF)
         pos_0based : 0-based BED start coordinate
-        gene_id    : gene_id from the annotation BED (column 16)
-        strand     : strand from the annotation BED (column 6)
+        gene_id    : gene_id from the annotation BED
+        strand     : strand
 
         Returns
         -------
-        (feature_type, dist_5ss, dist_3ss, splice_region)
-        feature_type : 'CDS_exon' | 'UTR' | 'intron' | 'intergenic'
-        dist_5ss     : int or None
-        dist_3ss     : int or None
-        splice_region: string label
+        (feature_type, dist_5ss, dist_3ss, splice_region, signed_5ss, signed_3ss)
+
+        dist_5ss / dist_3ss : absolute distance (nt) from nearest splice boundary;
+                              None for non-intronic sites
+        signed_5ss : signed position relative to the 5' splice site (donor).
+                     Convention: negative = upstream/exonic side of donor,
+                                 positive = downstream/intronic side.
+                     Follows standard splice-site numbering: -1 is the last exon
+                     base, +1 is the first intron base.
+                     For exonic sites this is the distance to the *right* exon
+                     boundary (+ strand) or *left* exon boundary (– strand).
+        signed_3ss : signed position relative to the 3' splice site (acceptor).
+                     Negative = upstream/intronic side of acceptor,
+                     positive = downstream/exonic side.
+                     For exonic sites: distance to the *left* exon boundary
+                     (+ strand) or *right* exon boundary (– strand).
         """
         if gene_id in ('.', ''):
-            return 'intergenic', None, None, 'intergenic'
+            return 'intergenic', None, None, 'intergenic', None, None
 
         pos1 = pos_0based + 1   # convert to 1-based
 
         key = (chrom, gene_id)
         exons = self._exons.get(key)
         if not exons:
-            return 'intergenic', None, None, 'intergenic'
+            return 'intergenic', None, None, 'intergenic', None, None
 
         # ── Is the site in a UTR? ───────────────────────────────────────
         utrs = self._utrs.get(key, [])
         in_utr = any(s <= pos1 <= e for s, e in utrs)
 
         # ── Is the site in any exon? ────────────────────────────────────
-        in_exon = any(s <= pos1 <= e for s, e in exons)
+        containing_exon = None
+        for s, e in exons:
+            if s <= pos1 <= e:
+                containing_exon = (s, e)
+                break
 
-        if in_exon:
+        if containing_exon is not None:
+            s, e = containing_exon
             ftype = 'UTR' if in_utr else 'CDS_exon'
-            return ftype, None, None, ftype
+            # Signed distances to nearest splice boundaries.
+            # +strand: 5'SS is at the right exon boundary (e), 3'SS at the left (s).
+            # –strand: 5'SS is at the left exon boundary (s), 3'SS at the right (e).
+            if strand == '+':
+                # negative = upstream of 5'SS donor;  +1 = last exon base
+                signed_5ss = -(e - pos1 + 1)
+                # positive = downstream of 3'SS acceptor; +1 = first exon base
+                signed_3ss = +(pos1 - s + 1)
+            else:
+                signed_5ss = -(pos1 - s + 1)
+                signed_3ss = +(e - pos1 + 1)
+            return ftype, None, None, ftype, signed_5ss, signed_3ss
 
         # ── Intronic: find flanking exons in genomic coordinates ────────
         left_exon  = None   # exon with max end  < pos1
@@ -199,26 +226,24 @@ class SpliceSiteAnnotator:
                 break
 
         if left_exon is None or right_exon is None:
-            # Outside the exon span (e.g. far upstream/downstream UTR extension)
-            return 'intergenic', None, None, 'intergenic'
+            return 'intergenic', None, None, 'intergenic', None, None
 
-        # ── Strand-aware splice site distances ─────────────────────────
-        # dist_to_left  = how far the site is from the right edge of the left exon
-        # dist_to_right = how far the site is from the left edge of the right exon
+        # ── Strand-aware absolute distances ────────────────────────────
         dist_to_left  = pos1 - left_exon[1]    # > 0 when intronic
         dist_to_right = right_exon[0] - pos1   # > 0 when intronic
 
         if strand == '+':
-            # 5'SS donor  is at the right boundary of the left exon
-            # 3'SS acceptor is at the left boundary of the right exon
             dist_5ss = dist_to_left
             dist_3ss = dist_to_right
         else:
-            # On – strand the pre-mRNA runs right→left in genomic coords.
-            # 5'SS donor  is at the left boundary of the right exon
-            # 3'SS acceptor is at the right boundary of the left exon
             dist_5ss = dist_to_right
             dist_3ss = dist_to_left
+
+        # ── Signed distances (intronic sites) ──────────────────────────
+        # +1 = first intronic base downstream of donor
+        # -1 = first intronic base upstream of acceptor
+        signed_5ss = +dist_5ss
+        signed_3ss = -dist_3ss
 
         # ── Classify splice region ─────────────────────────────────────
         if dist_5ss <= DONOR_PROXIMAL_NT:
@@ -230,7 +255,7 @@ class SpliceSiteAnnotator:
         else:
             region = 'deep_intronic'
 
-        return 'intron', dist_5ss, dist_3ss, region
+        return 'intron', dist_5ss, dist_3ss, region, signed_5ss, signed_3ss
 
 
 # ------------------------------------------------------------------ #
@@ -247,7 +272,9 @@ def annotate(editing_sites: str, gtf: str, output: str):
     with open(editing_sites) as inf, open(output, 'w') as outf:
         for line in inf:
             if line.startswith('#'):
-                header = line.rstrip('\n') + '\tfeature_type\tdist_5ss\tdist_3ss\tsplice_region\n'
+                header = (line.rstrip('\n')
+                          + '\tfeature_type\tdist_5ss\tdist_3ss\tsplice_region'
+                          + '\tsigned_5ss\tsigned_3ss\n')
                 outf.write(header)
                 continue
 
@@ -257,12 +284,17 @@ def annotate(editing_sites: str, gtf: str, output: str):
             strand  = fields[5]  if len(fields) > 5  else '.'
             gene_id = fields[15] if len(fields) > 15 else '.'
 
-            ftype, d5, d3, region = annotator.classify(chrom, pos, gene_id, strand)
+            ftype, d5, d3, region, s5, s3 = annotator.classify(
+                chrom, pos, gene_id, strand)
 
             d5_str = str(d5) if d5 is not None else 'NA'
             d3_str = str(d3) if d3 is not None else 'NA'
+            s5_str = str(s5) if s5 is not None else 'NA'
+            s3_str = str(s3) if s3 is not None else 'NA'
 
-            outf.write('\t'.join(fields) + f'\t{ftype}\t{d5_str}\t{d3_str}\t{region}\n')
+            outf.write('\t'.join(fields)
+                       + f'\t{ftype}\t{d5_str}\t{d3_str}\t{region}'
+                       + f'\t{s5_str}\t{s3_str}\n')
             counts[region] += 1
             total += 1
 

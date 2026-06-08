@@ -3,25 +3,31 @@
 Splice Site Distance Plots for HyperTRIBE Editing Sites
 ========================================================
 
-Generates a multi-panel PDF summarising where intronic editing sites fall
-relative to the splicing machinery:
+Generates metagene-style density plots showing where editing sites fall
+relative to each splice element.  Each plot is centered at position 0
+(the splice element itself) with:
 
-  Panel 1 — Genomic feature breakdown (UTR / CDS_exon / intron / intergenic)
-  Panel 2 — Intronic sub-region breakdown
-             (5ss_proximal / ppt_region / 3ss_proximal / deep_intronic)
-  Panel 3 — Distance-from-5'SS distribution (intronic sites, 0-300 nt)
-             with the donor-proximal zone annotated
-  Panel 4 — Distance-from-3'SS distribution (intronic sites, 0-300 nt)
-             with PPT and acceptor-proximal zones annotated
-  Panel 5 — (optional) Scatter of dist_5ss vs dist_3ss coloured by splice_region
+    negative = upstream  (5' side, towards mRNA 5' cap)
+    positive = downstream (3' side, towards mRNA 3' poly-A)
 
-If multiple input files are provided (e.g. WT, S161, S206) they are overlaid
-on Panels 3/4 so you can compare conditions side by side.
+Panels:
+  1 – Genomic feature breakdown (UTR / CDS_exon / intron / intergenic)
+  2 – Intronic sub-region breakdown (5ss_proximal … deep_intronic)
+  3 – Metagene centred on 5'SS donor
+       Exonic sites cluster at negative positions (last exon bases),
+       intronic sites at positive (first intron bases).
+  4 – Metagene centred on 3'SS acceptor
+       Intronic/PPT sites cluster at negative positions,
+       exonic sites at positive.
+  5 – Metagene centred on PPT centre (−27 nt from 3'SS)
+       Shows whether editing enriches at the branch-point / PPT window.
+
+Multiple input files are overlaid on panels 3–5 to compare conditions.
 
 Usage:
     python plot_splice_distances.py \\
-        --input  results/puf60_wt/splice_annotated_editing_sites.bed \\
-                 results/puf60_s161/splice_annotated_editing_sites.bed \\
+        --input wt/splice_annotated_editing_sites.bed \\
+                s161/splice_annotated_editing_sites.bed \\
         --labels WT S161 \\
         --output results/plots/splice_distance_comparison.pdf
 """
@@ -37,9 +43,8 @@ import pandas as pd
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-from matplotlib.lines import Line2D
 import seaborn as sns
+from scipy.stats import gaussian_kde
 
 logging.basicConfig(
     level=logging.INFO,
@@ -50,38 +55,23 @@ logger = logging.getLogger(__name__)
 
 sns.set_style('whitegrid')
 plt.rcParams.update({
-    'figure.dpi': 150,
-    'savefig.dpi': 300,
-    'font.size': 11,
-    'axes.titlesize': 12,
-    'axes.labelsize': 11,
+    'figure.dpi': 150, 'savefig.dpi': 300,
+    'font.size': 11, 'axes.titlesize': 12, 'axes.labelsize': 11,
 })
 
-# Colours (colourblind-friendly)
 _REGION_COLORS = {
-    'UTR':             '#3498db',
-    'CDS_exon':        '#2ecc71',
-    'intron':          '#e74c3c',
-    'intergenic':      '#95a5a6',
-    '5ss_proximal':    '#e74c3c',
-    '3ss_proximal':    '#e67e22',
-    'ppt_region':      '#f1c40f',
-    'deep_intronic':   '#9b59b6',
+    'UTR': '#3498db', 'CDS_exon': '#2ecc71',
+    'intron': '#e74c3c', 'intergenic': '#95a5a6',
+    '5ss_proximal': '#e74c3c', '3ss_proximal': '#e67e22',
+    'ppt_region': '#f1c40f', 'deep_intronic': '#9b59b6',
 }
-
 _COND_PALETTE = ['#2980b9', '#e74c3c', '#27ae60', '#8e44ad', '#f39c12']
 
-# Splice site proximity thresholds (must match annotate_splice_sites.py)
-DONOR_PROXIMAL_NT    = 8
-ACCEPTOR_PROXIMAL_NT = 3
-PPT_MAX_NT           = 50
-PPT_MIN_NT           = 4
+PPT_CENTER_FROM_3SS = 27    # midpoint of PPT window (4–50 nt from 3'SS)
 
 
 def _load(path: str, label: str) -> pd.DataFrame:
-    df = pd.read_csv(path, sep='\t', comment='#', header=None,
-                     low_memory=False)
-    # Assign column names based on expected layout
+    df = pd.read_csv(path, sep='\t', comment='#', header=None, low_memory=False)
     base_cols = [
         'chr', 'start', 'end', 'gene', 'edit_freq', 'strand',
         'control_cov', 'control_A', 'control_G',
@@ -89,262 +79,238 @@ def _load(path: str, label: str) -> pd.DataFrame:
         'fold_change', 'p_value', 'n_replicates',
         'gene_id', 'gene_type',
         'feature_type', 'dist_5ss', 'dist_3ss', 'splice_region',
+        'signed_5ss', 'signed_3ss',
     ]
     n = df.shape[1]
     df.columns = (base_cols + [f'extra_{i}' for i in range(n - len(base_cols))])[:n]
-
-    # Coerce distances to numeric (NA → NaN)
-    df['dist_5ss'] = pd.to_numeric(df['dist_5ss'], errors='coerce')
-    df['dist_3ss'] = pd.to_numeric(df['dist_3ss'], errors='coerce')
-    df['edit_freq'] = pd.to_numeric(df['edit_freq'], errors='coerce')
+    for col in ('dist_5ss', 'dist_3ss', 'signed_5ss', 'signed_3ss', 'edit_freq'):
+        df[col] = pd.to_numeric(df[col], errors='coerce')
     df['label'] = label
-    logger.info(f"  {label}: {len(df):,} sites loaded")
+    logger.info(f"  {label}: {len(df):,} sites "
+                f"({df['feature_type'].value_counts().to_dict()})")
     return df
 
 
-def _panel_feature_breakdown(ax, dfs: List[pd.DataFrame], labels: List[str]):
-    """Grouped bar chart: feature_type fractions per condition."""
-    categories = ['UTR', 'CDS_exon', 'intron', 'intergenic']
+# ─────────────────────────────────────────────────────────────────────────────
+# Breakdown bar charts
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _panel_feature_breakdown(ax, dfs, labels):
+    cats = ['UTR', 'CDS_exon', 'intron', 'intergenic']
     x = np.arange(len(labels))
-    width = 0.18
-    offsets = np.linspace(-(len(categories)-1)*width/2,
-                           (len(categories)-1)*width/2,
-                           len(categories))
-
-    for i, cat in enumerate(categories):
-        pcts = []
-        for df in dfs:
-            n = len(df)
-            pcts.append(100 * (df['feature_type'] == cat).sum() / n if n else 0)
-        bars = ax.bar(x + offsets[i], pcts, width,
-                      color=_REGION_COLORS.get(cat, '#aaa'),
-                      label=cat, edgecolor='white', linewidth=0.5)
-
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels, fontsize=10)
-    ax.set_ylabel('% of editing sites')
+    w = 0.18
+    offsets = np.linspace(-(len(cats)-1)*w/2, (len(cats)-1)*w/2, len(cats))
+    for i, cat in enumerate(cats):
+        pcts = [100*(df['feature_type']==cat).sum()/len(df) for df in dfs]
+        ax.bar(x+offsets[i], pcts, w, color=_REGION_COLORS[cat],
+               label=cat, edgecolor='white', linewidth=0.5)
+    ax.set_xticks(x); ax.set_xticklabels(labels, fontsize=10)
+    ax.set_ylabel('% of all editing sites'); ax.set_ylim(0, 100)
     ax.set_title('Genomic Feature Distribution')
     ax.legend(fontsize=9, frameon=True)
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
-    ax.set_ylim(0, 100)
+    ax.spines['top'].set_visible(False); ax.spines['right'].set_visible(False)
 
 
-def _panel_intronic_breakdown(ax, dfs: List[pd.DataFrame], labels: List[str]):
-    """Stacked bar chart: splice region sub-categories for intronic sites."""
-    categories = ['5ss_proximal', '3ss_proximal', 'ppt_region', 'deep_intronic']
-    x = np.arange(len(labels))
-    bottoms = np.zeros(len(labels))
-
-    for cat in categories:
+def _panel_intronic_breakdown(ax, dfs, labels):
+    cats = ['5ss_proximal', '3ss_proximal', 'ppt_region', 'deep_intronic']
+    x = np.arange(len(labels)); bottoms = np.zeros(len(labels))
+    for cat in cats:
         pcts = []
         for df in dfs:
-            intronic = df[df['feature_type'] == 'intron']
-            n = len(intronic)
-            pcts.append(100 * (intronic['splice_region'] == cat).sum() / n if n else 0)
-        ax.bar(x, pcts, bottom=bottoms,
-               color=_REGION_COLORS.get(cat, '#aaa'),
+            intr = df[df['feature_type']=='intron']
+            pcts.append(100*(intr['splice_region']==cat).sum()/max(len(intr),1))
+        ax.bar(x, pcts, bottom=bottoms, color=_REGION_COLORS[cat],
                label=cat, edgecolor='white', linewidth=0.5)
         bottoms += np.array(pcts)
-
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels, fontsize=10)
-    ax.set_ylabel('% of intronic sites')
-    ax.set_title('Intronic Sub-Region (of intronic sites)')
+    ax.set_xticks(x); ax.set_xticklabels(labels, fontsize=10)
+    ax.set_ylabel('% of intronic sites'); ax.set_ylim(0, 100)
+    ax.set_title('Intronic Sub-Region Breakdown')
     ax.legend(fontsize=9, frameon=True, loc='upper right')
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
-    ax.set_ylim(0, 100)
+    ax.spines['top'].set_visible(False); ax.spines['right'].set_visible(False)
 
 
-def _panel_distance_hist(ax, dfs: List[pd.DataFrame], labels: List[str],
-                          col: str, title: str, max_dist: int = 300,
-                          zones: Optional[list] = None):
+# ─────────────────────────────────────────────────────────────────────────────
+# Metagene density plot helper
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _metagene(ax, dfs: List[pd.DataFrame], labels: List[str],
+              col: str, title: str,
+              xmin: int, xmax: int,
+              shade_zones: Optional[list] = None,
+              vlines: Optional[list] = None):
     """
-    Overlaid KDE/step histograms of dist_5ss or dist_3ss for intronic sites.
-    `zones` is a list of (xmin, xmax, color, label) rectangles to shade.
+    Signed-distance metagene plot.
+    col       : column name carrying the signed position values
+    xmin/xmax : x-axis range (nt)
+    shade_zones: list of (x0, x1, color, alpha, label)
+    vlines    : list of (x, color, label) dashed vertical lines
     """
-    bins = np.arange(0, max_dist + 10, 10)
+    bins = np.arange(xmin, xmax + 1, 5)
 
+    all_counts = np.zeros(len(bins)-1)
     for df, label, color in zip(dfs, labels, _COND_PALETTE):
-        sub = df[(df['feature_type'] == 'intron') & df[col].notna()
-                 & (df[col] <= max_dist)]
-        if sub.empty:
+        vals = df[col].dropna()
+        vals = vals[(vals >= xmin) & (vals <= xmax)]
+        if len(vals) < 5:
             continue
-        ax.hist(sub[col], bins=bins, density=True,
-                histtype='step', linewidth=1.8,
-                color=color, label=f'{label} (n={len(sub):,})',
-                alpha=0.85)
-        # Add KDE overlay
-        from scipy.stats import gaussian_kde
-        vals = sub[col].values
-        if len(vals) > 5:
-            kde = gaussian_kde(vals, bw_method=0.15)
-            xs = np.linspace(0, max_dist, 400)
-            ax.plot(xs, kde(xs), color=color, linewidth=1.2, alpha=0.6,
-                    linestyle='--')
+        counts, _ = np.histogram(vals, bins=bins)
+        all_counts += counts
 
-    # Shade splice-element zones
-    if zones:
-        for xmin, xmax, zcolor, zlabel in zones:
-            ax.axvspan(xmin, xmax, alpha=0.12, color=zcolor, zorder=0)
-            ax.axvline(xmax, color=zcolor, linestyle=':', linewidth=1.0, alpha=0.8)
+        # Normalised step histogram
+        ax.step(bins[:-1], counts / counts.sum() * 100,
+                where='mid', color=color, linewidth=1.6,
+                label=f'{label} (n={len(vals):,})', alpha=0.85)
 
-    ax.set_xlabel(f'Distance (nt)')
-    ax.set_ylabel('Density')
+        # KDE overlay
+        kde = gaussian_kde(vals.values, bw_method=0.10)
+        xs  = np.linspace(xmin, xmax, 600)
+        kde_vals = kde(xs)
+        ax.plot(xs, kde_vals / kde_vals.sum() * len(bins) * 100,
+                color=color, linewidth=1.0, linestyle='--', alpha=0.5)
+
+    # Shaded functional zones
+    if shade_zones:
+        for x0, x1, zc, za, zlabel in shade_zones:
+            ax.axvspan(x0, x1, alpha=za, color=zc, zorder=0, label=zlabel)
+
+    # Functional landmark lines
+    ax.axvline(0, color='black', linewidth=1.8, linestyle='-', zorder=5, label='Splice site (0)')
+    if vlines:
+        for xv, vc, vl in vlines:
+            ax.axvline(xv, color=vc, linewidth=1.0, linestyle=':', alpha=0.8, label=vl)
+
+    ax.set_xlabel('Position relative to splice element (nt)')
+    ax.set_ylabel('% of sites per 5-nt bin')
     ax.set_title(title)
-    ax.legend(fontsize=9, frameon=True)
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
-    ax.set_xlim(0, max_dist)
+    ax.legend(fontsize=8, frameon=True, loc='upper right')
+    ax.spines['top'].set_visible(False); ax.spines['right'].set_visible(False)
+    ax.set_xlim(xmin, xmax)
+
+    # Annotate axis sides
+    ax.text(xmin * 0.92, ax.get_ylim()[1] * 0.92, '← upstream\n(5\' side)',
+            fontsize=8, color='#555', ha='left', va='top')
+    ax.text(xmax * 0.92, ax.get_ylim()[1] * 0.92, 'downstream →\n(3\' side)',
+            fontsize=8, color='#555', ha='right', va='top')
 
 
-def _panel_distance_full_log(ax, dfs: List[pd.DataFrame], labels: List[str], col: str, title: str):
-    """Log-scale histogram of full distance range — captures deep intronic sites."""
-    bins = np.logspace(0, 6, 60)
-    for df, label, color in zip(dfs, labels, _COND_PALETTE):
-        sub = df[(df['feature_type'] == 'intron') & df[col].notna() & (df[col] > 0)]
-        if sub.empty:
-            continue
-        ax.hist(sub[col], bins=bins, histtype='step', linewidth=1.8,
-                color=color, label=f'{label} (n={len(sub):,})',
-                density=True, alpha=0.85)
-    ax.set_xscale('log')
-    ax.set_xlabel('Distance (nt, log scale)')
-    ax.set_ylabel('Density')
-    ax.set_title(title)
-    ax.legend(fontsize=9, frameon=True)
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
+# ─────────────────────────────────────────────────────────────────────────────
+# Main plot
+# ─────────────────────────────────────────────────────────────────────────────
 
+def plot(input_files: List[str], labels: List[str], output: str,
+         window_5ss: int = 300, window_3ss: int = 300, window_ppt: int = 60):
 
-def _panel_scatter(ax, df: pd.DataFrame, label: str):
-    """Scatter of dist_5ss vs dist_3ss, coloured by splice_region (first sample)."""
-    intronic = df[(df['feature_type'] == 'intron')
-                  & df['dist_5ss'].notna() & df['dist_3ss'].notna()]
-    cap = 500
-    intronic = intronic.copy()
-    intronic['d5_capped'] = intronic['dist_5ss'].clip(upper=cap)
-    intronic['d3_capped'] = intronic['dist_3ss'].clip(upper=cap)
-
-    region_order = ['5ss_proximal', 'ppt_region', '3ss_proximal', 'deep_intronic']
-    for reg in region_order:
-        sub = intronic[intronic['splice_region'] == reg]
-        ax.scatter(sub['d5_capped'], sub['d3_capped'],
-                   s=12, alpha=0.55, label=reg,
-                   color=_REGION_COLORS.get(reg, '#aaa'),
-                   linewidths=0)
-
-    # Add zone lines
-    ax.axvline(DONOR_PROXIMAL_NT, color='#e74c3c', linestyle='--',
-               linewidth=1.0, alpha=0.7)
-    ax.axhline(ACCEPTOR_PROXIMAL_NT, color='#e67e22', linestyle='--',
-               linewidth=1.0, alpha=0.7)
-    ax.axhline(PPT_MAX_NT, color='#f1c40f', linestyle='--',
-               linewidth=1.0, alpha=0.7)
-    ax.text(DONOR_PROXIMAL_NT + 2, cap * 0.92, f'5\'SS ≤{DONOR_PROXIMAL_NT}nt',
-            fontsize=8, color='#e74c3c')
-    ax.text(5, PPT_MAX_NT + 8, f'PPT ≤{PPT_MAX_NT}nt', fontsize=8, color='#c0a000')
-
-    ax.set_xlabel(f"dist_5'SS (nt, capped at {cap})")
-    ax.set_ylabel(f"dist_3'SS (nt, capped at {cap})")
-    ax.set_title(f"dist_5'SS vs dist_3'SS — {label}")
-    ax.legend(fontsize=8, frameon=True, markerscale=1.5)
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
-
-
-def plot(input_files: List[str], labels: List[str], output: str):
     dfs = [_load(f, l) for f, l in zip(input_files, labels)]
 
-    fig = plt.figure(figsize=(18, 22))
-    gs = fig.add_gridspec(4, 3, hspace=0.45, wspace=0.38)
+    # Compute PPT-centre column: signed_3ss + PPT_CENTER_FROM_3SS
+    # → 0 = PPT centre, negative = further upstream, positive = toward 3'SS
+    for df in dfs:
+        df['signed_ppt'] = df['signed_3ss'] + PPT_CENTER_FROM_3SS
 
-    # Row 0: feature breakdown (col 0-1) + intronic sub-region (col 2)
-    ax_feat  = fig.add_subplot(gs[0, :2])
-    ax_intr  = fig.add_subplot(gs[0, 2])
+    fig = plt.figure(figsize=(18, 24))
+    from matplotlib.gridspec import GridSpec
+    gs = GridSpec(4, 2, figure=fig, hspace=0.52, wspace=0.35)
 
-    # Row 1: dist_5ss zoom (col 0-1) + dist_3ss zoom (col 2)
-    ax_d5z   = fig.add_subplot(gs[1, :2])
-    ax_d3z   = fig.add_subplot(gs[1, 2])
-
-    # Row 2: log-scale dist_5ss (col 0-1) + log-scale dist_3ss (col 2)
-    ax_d5l   = fig.add_subplot(gs[2, :2])
-    ax_d3l   = fig.add_subplot(gs[2, 2])
-
-    # Row 3: scatter (first condition only)
-    ax_scat  = fig.add_subplot(gs[3, :])
+    ax_feat = fig.add_subplot(gs[0, 0])
+    ax_intr = fig.add_subplot(gs[0, 1])
+    ax_d5   = fig.add_subplot(gs[1, :])
+    ax_d3   = fig.add_subplot(gs[2, :])
+    ax_ppt  = fig.add_subplot(gs[3, :])
 
     _panel_feature_breakdown(ax_feat, dfs, labels)
     _panel_intronic_breakdown(ax_intr, dfs, labels)
 
-    _panel_distance_hist(
-        ax_d5z, dfs, labels, 'dist_5ss',
-        "Distance from 5' Splice Site (donor) — zoomed",
-        max_dist=300,
-        zones=[
-            (0, DONOR_PROXIMAL_NT, '#e74c3c', f"5'SS ≤{DONOR_PROXIMAL_NT}nt"),
+    # ── 5'SS metagene ──────────────────────────────────────────────────
+    _metagene(
+        ax_d5, dfs, labels, 'signed_5ss',
+        "Position Relative to 5' Splice Site (donor = 0)\n"
+        "negative = exonic (upstream),  positive = intronic (downstream)",
+        xmin=-window_5ss, xmax=window_5ss,
+        shade_zones=[
+            (-window_5ss, 0,     '#3498db', 0.06, 'exon'),
+            (0,  8,              '#e74c3c', 0.12, f'5\'SS proximal (≤8 nt)'),
+            (0,  window_5ss,     '#e74c3c', 0.04, 'intron'),
+        ],
+        vlines=[
+            (-3, '#888', 'exon -3'),
+            (8, '#e74c3c', '+8 nt (donor consensus end)'),
         ]
     )
 
-    _panel_distance_hist(
-        ax_d3z, dfs, labels, 'dist_3ss',
-        "Distance from 3' Splice Site (acceptor) — zoomed",
-        max_dist=300,
-        zones=[
-            (0, ACCEPTOR_PROXIMAL_NT, '#e67e22', f"3'SS ≤{ACCEPTOR_PROXIMAL_NT}nt"),
-            (PPT_MIN_NT, PPT_MAX_NT, '#f1c40f', f"PPT {PPT_MIN_NT}–{PPT_MAX_NT}nt"),
+    # ── 3'SS metagene ──────────────────────────────────────────────────
+    _metagene(
+        ax_d3, dfs, labels, 'signed_3ss',
+        "Position Relative to 3' Splice Site (acceptor = 0)\n"
+        "negative = intronic (upstream / PPT region),  positive = exonic (downstream)",
+        xmin=-window_3ss, xmax=window_3ss,
+        shade_zones=[
+            (0,  window_3ss,     '#3498db', 0.06, 'exon'),
+            (-window_3ss, 0,     '#e67e22', 0.04, 'intron'),
+            (-50, -4,            '#f1c40f', 0.18, 'PPT (−50 to −4)'),
+            (-3,  0,             '#e74c3c', 0.18, '3\'SS proximal (AG, ≤3 nt)'),
+        ],
+        vlines=[
+            (-50, '#f39c12', 'PPT start (−50)'),
+            (-27, '#c0a000', 'PPT centre (−27)'),
+            (-4,  '#f39c12', 'PPT end (−4)'),
+            (-3,  '#e74c3c', '3\'SS proximal (−3)'),
         ]
     )
 
-    _panel_distance_full_log(ax_d5l, dfs, labels, 'dist_5ss',
-                              "Distance from 5'SS — full range (log)")
-    _panel_distance_full_log(ax_d3l, dfs, labels, 'dist_3ss',
-                              "Distance from 3'SS — full range (log)")
+    # ── PPT-centre metagene ────────────────────────────────────────────
+    _metagene(
+        ax_ppt, dfs, labels, 'signed_ppt',
+        f"Position Relative to PPT Centre (−{PPT_CENTER_FROM_3SS} nt from 3'SS = 0)\n"
+        "negative = upstream (toward 5'SS),  positive = downstream (toward 3'SS / AG)",
+        xmin=-window_ppt, xmax=window_ppt,
+        shade_zones=[
+            (-23, +23, '#f1c40f', 0.18, 'PPT window (±23 nt from centre)'),
+            (+23, window_ppt, '#e74c3c', 0.12, 'Toward AG'),
+        ],
+        vlines=[
+            (+23, '#e74c3c', '3\'SS proximal zone'),
+            (-23, '#f39c12', 'PPT upstream edge'),
+        ]
+    )
 
-    _panel_scatter(ax_scat, dfs[0], labels[0])
-
-    fig.suptitle("HyperTRIBE — Intronic Editing Site Proximity to Splice Elements",
-                 fontsize=15, fontweight='bold', y=0.998)
-
+    fig.suptitle("HyperTRIBE — Editing Site Position Relative to Splice Elements",
+                 fontsize=15, fontweight='bold', y=1.002)
     Path(output).parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(output, bbox_inches='tight')
     plt.close()
     logger.info(f"Saved: {output}")
 
-    # Print summary table
+    # Summary stats
     for df, label in zip(dfs, labels):
-        intronic = df[df['feature_type'] == 'intron']
-        n = len(intronic)
-        logger.info(f"\n{label} — intronic sites: {n:,}")
-        if n:
-            for reg in ['5ss_proximal', '3ss_proximal', 'ppt_region', 'deep_intronic']:
-                cnt = (intronic['splice_region'] == reg).sum()
-                logger.info(f"  {reg:20s}: {cnt:4d}  ({100*cnt/n:.1f}%)")
-            logger.info(f"  dist_5ss median : {intronic['dist_5ss'].median():.0f} nt")
-            logger.info(f"  dist_3ss median : {intronic['dist_3ss'].median():.0f} nt")
+        n = len(df)
+        logger.info(f"\n{label}  (n={n:,})")
+        for feat in ('UTR', 'CDS_exon', 'intron', 'intergenic'):
+            cnt = (df['feature_type']==feat).sum()
+            logger.info(f"  {feat:12s}: {cnt:5d}  ({100*cnt/n:.1f}%)")
+        intr = df[df['feature_type']=='intron']
+        if len(intr):
+            logger.info(f"  intronic signed_5ss median: {intr['signed_5ss'].median():.0f} nt")
+            logger.info(f"  intronic signed_3ss median: {intr['signed_3ss'].median():.0f} nt")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Plot splice site distance distributions',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__
-    )
-    parser.add_argument('--input', nargs='+', required=True,
-                        help='Splice-annotated BED file(s)')
-    parser.add_argument('--labels', nargs='+',
-                        help='Label(s) for each input (default: filename stems)')
-    parser.add_argument('--output', required=True,
-                        help='Output PDF path')
+        description='Splice site metagene distance plots',
+        formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
+    parser.add_argument('--input', nargs='+', required=True)
+    parser.add_argument('--labels', nargs='+')
+    parser.add_argument('--output', required=True)
+    parser.add_argument('--window-5ss', type=int, default=300)
+    parser.add_argument('--window-3ss', type=int, default=300)
+    parser.add_argument('--window-ppt', type=int, default=60)
     args = parser.parse_args()
 
-    labels = args.labels or [Path(f).stem.replace('_splice_annotated_editing_sites', '')
-                              for f in args.input]
+    labels = args.labels or [Path(f).stem for f in args.input]
     if len(labels) != len(args.input):
         parser.error('--labels must have same count as --input')
 
-    plot(args.input, labels, args.output)
+    plot(args.input, labels, args.output,
+         args.window_5ss, args.window_3ss, args.window_ppt)
 
 
 if __name__ == '__main__':

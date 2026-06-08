@@ -81,6 +81,49 @@ random.seed(42)
 
 DNA_COMPLEMENT = str.maketrans('ACGTacgtNn', 'TGCAtgcaNn')
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Reference RBP binding motifs  (frequency matrices, columns = A C G T)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# PUF60  (Poly-U binding Factor 60 kDa / FIR / SIAHBP1)
+# ---------------------------------------------------------------
+# PUF60 contains two RRM domains and a U2AF-homology motif (UHM).
+# It cooperates with U2AF65 at polypyrimidine tracts near the 3'SS,
+# recognising UC-rich sequences.
+# PWM approximated from ENCODE eCLIP (K562 + HepG2) and from
+# Salton et al. 2008 EMBO Rep; Masuda et al. 2012 Nat Struct Mol Biol.
+# Core consensus: UCUCUUUU  (8-mer, coding-strand DNA).
+# NOTE: PUF60 ≠ pumilio/PUF family. The "PUF" in PUF60 stands for
+# "Poly-U Factor", not pumilio.  See clarification panel below.
+_PUF60_MOTIF = pd.DataFrame({
+    'A': [0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05],
+    'C': [0.32, 0.28, 0.35, 0.28, 0.30, 0.28, 0.25, 0.25],
+    'G': [0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05],
+    'T': [0.58, 0.62, 0.55, 0.62, 0.60, 0.62, 0.65, 0.65],
+})
+
+# Pumilio / PUF-family  (Wickens-group "PUF code")
+# ---------------------------------------------------------------
+# PUF-family proteins (Pumilio, FBF, Puf1–5) contain a pumilio-homology
+# domain (PUM-HD) with 8 PUF repeats, each recognising one RNA base via
+# a two-amino-acid recognition code.
+# Classic consensus: 5'-UGUAHAUA-3' (RNA), H = not G.
+# Key refs: Zamore et al. 1997 Cell; Edwards et al. 2001 Struct;
+#           Gerber et al. 2004 Genes Dev; Bernstein et al. 2005 Science;
+#           Weidmann & Goldstrohm 2012 Nat Chem Biol.
+# DNA coding-strand: T-G-T-A-[ACT]-A-T-A
+_PUMILIO_MOTIF = pd.DataFrame({
+    'A': [0.02, 0.02, 0.02, 0.94, 0.31, 0.94, 0.02, 0.94],
+    'C': [0.02, 0.02, 0.02, 0.02, 0.31, 0.02, 0.02, 0.02],
+    'G': [0.02, 0.94, 0.02, 0.02, 0.00, 0.02, 0.02, 0.02],
+    'T': [0.94, 0.02, 0.94, 0.02, 0.38, 0.02, 0.94, 0.02],
+})
+
+_KNOWN_MOTIFS = {
+    'PUF60\n(UC-rich PPT)':  _PUF60_MOTIF,
+    'Pumilio/PUF\n(UGUAHAUA)': _PUMILIO_MOTIF,
+}
+
 
 def revcomp(seq: str) -> str:
     return seq.translate(DNA_COMPLEMENT)[::-1]
@@ -100,11 +143,12 @@ def _load_bed(path: str) -> pd.DataFrame:
         'fold_change', 'p_value', 'n_replicates',
         'gene_id', 'gene_type',
         'feature_type', 'dist_5ss', 'dist_3ss', 'splice_region',
+        'signed_5ss', 'signed_3ss',
     ]
     n = df.shape[1]
     df.columns = (base_cols + [f'extra_{i}' for i in range(n - len(base_cols))])[:n]
-    df['dist_5ss'] = pd.to_numeric(df['dist_5ss'], errors='coerce')
-    df['dist_3ss'] = pd.to_numeric(df['dist_3ss'], errors='coerce')
+    for col in ('dist_5ss', 'dist_3ss', 'signed_5ss', 'signed_3ss'):
+        df[col] = pd.to_numeric(df[col], errors='coerce')
     return df
 
 
@@ -335,6 +379,106 @@ def _draw_trinuc_bar(ax, seqs: List[str], center: int, title: str):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Known-motif scanning and comparison helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _pwm_log_odds(pwm: pd.DataFrame, bg: float = 0.25) -> np.ndarray:
+    """Convert frequency matrix to log-odds (nats). Returns (L × 4) array."""
+    arr = pwm[list('ACGT')].values.clip(min=1e-9)
+    return np.log(arr / bg)
+
+
+def _score_sequence(seq: str, lo_matrix: np.ndarray) -> float:
+    """
+    Best log-odds score for a k-mer PWM scanned across seq.
+    Returns -inf if sequence is too short or contains only Ns.
+    """
+    base_idx = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
+    k = lo_matrix.shape[0]
+    if len(seq) < k:
+        return -np.inf
+    best = -np.inf
+    for i in range(len(seq) - k + 1):
+        kmer = seq[i:i + k].upper()
+        if 'N' in kmer:
+            continue
+        score = sum(lo_matrix[j, base_idx.get(b, 0)] for j, b in enumerate(kmer))
+        if score > best:
+            best = score
+    return best
+
+
+def _positional_motif_scores(seqs: List[str], lo_matrix: np.ndarray,
+                              flank: int) -> np.ndarray:
+    """
+    For each position p in [-flank, flank] and each sequence, compute the
+    log-odds score of the k-mer that starts at position p.
+    Returns array of shape (2*flank+1,) with mean scores per position.
+    """
+    k = lo_matrix.shape[0]
+    base_idx = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
+    L = 2 * flank + 1
+    position_scores = [[] for _ in range(L - k + 1)]
+
+    for seq in seqs:
+        if not seq or len(seq) < L or 'N' in seq:
+            continue
+        for i in range(L - k + 1):
+            kmer = seq[i:i + k].upper()
+            score = sum(lo_matrix[j, base_idx.get(b, 0)] for j, b in enumerate(kmer))
+            position_scores[i].append(score)
+
+    means = np.array([np.mean(v) if v else np.nan for v in position_scores])
+    return means
+
+
+def _draw_motif_reference(ax, pwm: pd.DataFrame, title: str):
+    """Draw the reference PWM as an information-content logo."""
+    ic = _information_content(pwm)
+    logo = logomaker.Logo(ic, ax=ax, color_scheme='classic',
+                           baseline_width=0.5, alpha=0.85)
+    logo.style_spines(visible=False)
+    logo.style_spines(spines=['left', 'bottom'], visible=True)
+    ax.set_ylabel('bits', fontsize=9)
+    ax.set_title(title, fontsize=10)
+
+
+def _draw_motif_enrichment(ax, edit_seqs: List[str], ctrl_seqs: List[str],
+                            lo_matrix: np.ndarray, motif_name: str, flank: int):
+    """
+    Plot mean motif score at each position in the ±flank window.
+    Editing sites (orange) vs. control (blue).  Position 0 = editing site.
+    """
+    k = lo_matrix.shape[0]
+    positions = np.arange(-(flank), flank - k + 2)   # start position of each k-mer
+
+    edit_scores = _positional_motif_scores(edit_seqs, lo_matrix, flank)
+    ctrl_scores  = _positional_motif_scores(ctrl_seqs, lo_matrix, flank)
+
+    ax.plot(positions, edit_scores, color='#e74c3c', linewidth=1.8,
+            label=f'Editing sites (n={len(edit_seqs):,})', zorder=3)
+    ax.plot(positions, ctrl_scores,  color='#3498db', linewidth=1.8,
+            linestyle='--', label=f'Control (n={len(ctrl_seqs):,})', zorder=3)
+    ax.fill_between(positions, edit_scores, ctrl_scores,
+                     where=(edit_scores > ctrl_scores),
+                     alpha=0.18, color='#e74c3c', label='Editing > control')
+    ax.fill_between(positions, edit_scores, ctrl_scores,
+                     where=(edit_scores < ctrl_scores),
+                     alpha=0.18, color='#3498db', label='Control > editing')
+    ax.axvline(0, color='black', linewidth=1.2, linestyle='-', zorder=5,
+               label='Editing site (A→I)')
+    ax.axhline(np.nanmean(ctrl_scores), color='#3498db', linewidth=0.8,
+               linestyle=':', alpha=0.7, label='Control mean')
+    ax.set_xlabel('Position relative to editing site (nt)')
+    ax.set_ylabel(f'Mean log-odds score')
+    ax.set_title(f'{motif_name} motif enrichment at editing sites\nvs. control (matched positions in same genes)',
+                 fontsize=10)
+    ax.legend(fontsize=8, frameon=True)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main analysis
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -501,9 +645,33 @@ def plot(input_file: str, fasta_file: str, gtf_file: str,
     logger.info(f"  acceptor: {len(accept_edit):,} editing / {len(accept_ctrl):,} control")
     logger.info(f"  branch-pt:{len(bp_edit):,} editing / {len(bp_ctrl):,} control")
 
+    # ── Control sequences for motif enrichment scan ─────────────────────────
+    logger.info("Generating matched control sequences for motif scan...")
+    ctrl_site_seqs = []
+    edited_positions = set(zip(df['chr'], df['start']))
+    for gene_id in set(df['gene_id'].dropna()):
+        if gene_id not in gene_introns:
+            continue
+        for (chrom, istart, iend, strand) in gene_introns[gene_id][:5]:
+            if iend - istart < 50:
+                continue
+            for _ in range(3):
+                pos1 = random.randint(istart + 16, iend - 16)
+                if (chrom, pos1 - 1) in edited_positions:
+                    continue
+                seq = _seq_around_site(fasta, chrom, pos1, strand, flank=15)
+                if seq and len(seq) == 31 and 'N' not in seq:
+                    ctrl_site_seqs.append(seq)
+    ctrl_site_seqs = random.sample(ctrl_site_seqs, min(1000, len(ctrl_site_seqs)))
+    logger.info(f"  control sequences: {len(ctrl_site_seqs):,}")
+
+    # Pre-compute log-odds matrices for motif scan
+    lo_puf60   = _pwm_log_odds(_PUF60_MOTIF)
+    lo_pumilio = _pwm_log_odds(_PUMILIO_MOTIF)
+
     # ── Build figure ────────────────────────────────────────────────────────
-    fig = plt.figure(figsize=(20, 30))
-    gs  = gridspec.GridSpec(6, 2, figure=fig, hspace=0.70, wspace=0.38)
+    fig = plt.figure(figsize=(20, 42))
+    gs  = gridspec.GridSpec(8, 2, figure=fig, hspace=0.72, wspace=0.38)
 
     # Row 0: trinucleotide context + all-site logo
     ax0a = fig.add_subplot(gs[0, 0])
@@ -520,8 +688,14 @@ def plot(input_file: str, fasta_file: str, gtf_file: str,
     # Row 4: BP window edit vs ctrl
     ax4a = fig.add_subplot(gs[4, 0])
     ax4b = fig.add_subplot(gs[4, 1])
-    # Row 5: note on comparison
-    ax5  = fig.add_subplot(gs[5, :])
+    # Row 5: Known motif references (PUF60 left, Pumilio right)
+    ax5a = fig.add_subplot(gs[5, 0])
+    ax5b = fig.add_subplot(gs[5, 1])
+    # Row 6: Motif enrichment scan (PUF60 left, Pumilio right)
+    ax6a = fig.add_subplot(gs[6, 0])
+    ax6b = fig.add_subplot(gs[6, 1])
+    # Row 7: note
+    ax7  = fig.add_subplot(gs[7, :])
 
     flank = 15
     center = flank  # 0-indexed centre position
@@ -582,28 +756,52 @@ def plot(input_file: str, fasta_file: str, gtf_file: str,
                title="Branch-Point Window (-40 to -10 from 3'SS)\nControl (Unedited Introns)",
                xtick_labels=bp_xticks)
 
-    # ── Panel 5: Note ────────────────────────────────────────────────────────
-    ax5.axis('off')
+    # ── Row 5: Known reference motif logos ──────────────────────────────────
+    _draw_motif_reference(
+        ax5a, _PUF60_MOTIF,
+        "Reference: PUF60 binding motif (UCUCUUUU consensus)\n"
+        "from ENCODE eCLIP + Salton et al. 2008 EMBO Rep\n"
+        "[PUF60 = Poly-U binding Factor; UHM/RRM protein; NOT pumilio family]"
+    )
+    _draw_motif_reference(
+        ax5b, _PUMILIO_MOTIF,
+        "Reference: Pumilio / PUF-family motif (UGUAHAUA, H=not G)\n"
+        "Wickens group 'PUF code' — Gerber et al. 2004; Bernstein et al. 2005\n"
+        "[Pumilio-homology domain proteins — distinct from PUF60]"
+    )
+
+    # ── Row 6: Motif enrichment scan at editing site (±15 nt window) ────────
+    _draw_motif_enrichment(
+        ax6a, all_site_seqs, ctrl_site_seqs,
+        lo_puf60, 'PUF60 (UC-rich PPT)', flank=15
+    )
+    _draw_motif_enrichment(
+        ax6b, all_site_seqs, ctrl_site_seqs,
+        lo_pumilio, 'Pumilio/PUF (UGUAHAUA)', flank=15
+    )
+
+    # ── Row 7: Note ──────────────────────────────────────────────────────────
+    ax7.axis('off')
     note = (
         "Notes:\n"
-        "• Sequence logos show information content (bits); positions with "
-        "strong conservation appear taller.\n"
-        "• Donor motif: exon[-3 to -1] | GT[+3 to +8] (GT highlighted in red); "
-        "intronic positions +1/+2 = GT in canonical splice sites.\n"
-        "• Acceptor motif: PPT[-20 to -3] | AG[-2 to -1] (AG highlighted); "
-        "exon positions +1 to +3.\n"
-        "• Branch-point window: -40 to -10 nt upstream of the 3' AG. "
-        "Canonical BP consensus = YYYYYYYYYYYYYNYYRAY (A is the 2'-OH branch point).\n"
-        "• Control sequences are drawn from the same gene set, "
-        "from introns that do NOT contain any editing site.\n"
+        "• Sequence logos show information content (bits).\n"
+        "• Donor motif (+1/+2 = GT highlighted red); Acceptor motif (-2/-1 = AG highlighted).\n"
+        "• Branch-point window: −40 to −10 nt from 3'SS. "
+        "Canonical BP consensus = YYYYYYYYYYYYYNYYR[A]Y (branch-point A in brackets).\n"
+        "• Control sequences: random intronic positions in the same edited genes "
+        "(introns without editing sites) — controls for gene-composition bias.\n"
+        "• IMPORTANT: PUF60 (Poly-U Factor 60 kDa, FIR/SIAHBP1) contains RRM/UHM "
+        "domains and binds polypyrimidine tracts.  It is NOT a pumilio/PUF-family "
+        "protein. The Wickens-group 'PUF code' (UGUAHAUA) describes pumilio-homology "
+        "domain proteins (Pumilio, FBF, Puf1–5). If a pumilio-type motif is enriched "
+        "at editing sites, that would be unexpected and worth investigating.\n"
         f"• Label: {label}"
     )
-    ax5.text(0.02, 0.90, note, transform=ax5.transAxes,
-             ha='left', va='top', fontsize=9.5,
-             family='monospace',
+    ax7.text(0.02, 0.90, note, transform=ax7.transAxes,
+             ha='left', va='top', fontsize=9.5, family='monospace',
              bbox=dict(boxstyle='round', facecolor='#f0f4f8', alpha=0.8))
 
-    fig.suptitle(f"HyperTRIBE — Splice Motif Analysis: {label}",
+    fig.suptitle(f"HyperTRIBE — Splice Motif Analysis + Known Motif Comparison: {label}",
                  fontsize=15, fontweight='bold', y=1.002)
 
     Path(output).parent.mkdir(parents=True, exist_ok=True)
