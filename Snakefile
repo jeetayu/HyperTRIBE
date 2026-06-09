@@ -450,9 +450,9 @@ rule extract_target_genes:
         "results/target_genes.txt"
     shell:
         """
-        # Extract gene names (column 4), remove duplicates, sort
-        awk '!/^#/ {{print $4}}' {input} | \
-            sort -u > {output}
+        # Extract gene names (column 4), skip intergenic ('.'), sort
+        awk '!/^#/ && $4!="." && $4!=""' {input} | \
+            awk '{{print $4}}' | sort -u > {output}
         """
 
 rule rank_genes_by_editing:
@@ -467,9 +467,9 @@ rule rank_genes_by_editing:
         "results/target_genes_by_editcount.txt"
     shell:
         """
-        # Count editing sites per gene, sort by count
-        awk '!/^#/ {{print $4}}' {input} | \
-            sort | uniq -c | sort -rn | \
+        # Count editing sites per gene, skip intergenic ('.'), sort by count
+        awk '!/^#/ && $4!="." && $4!=""' {input} | \
+            awk '{{print $4}}' | sort | uniq -c | sort -rn | \
             awk '{{print $2"\\t"$1}}' > {output}
         """
 
