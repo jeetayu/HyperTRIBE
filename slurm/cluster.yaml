@@ -49,11 +49,13 @@ multiqc:
   mem:        "32G"
 
 # ── Editing Site Calling (most CPU/memory intensive step) ────────────────────
-# Loads all control + treatment BAMs simultaneously across parallel genome chunks
+# Loads all control + treatment BAMs simultaneously across parallel genome chunks.
+# Regular cpu nodes have sufficient RAM (196G requested); cpu_highmem (up to 4T)
+# is overkill and has poor availability.
 call_editing_sites:
-  partition:  "cpu_highmem"
+  partition:  "cpu"
   time:       "72:00:00"
-  mem:        "256G"
+  mem:        "196G"
 
 # ── Filtering & Annotation ───────────────────────────────────────────────────
 filter_replicates:
