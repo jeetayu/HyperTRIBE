@@ -57,44 +57,68 @@ def load_bed(path: str) -> pd.DataFrame:
     return df
 
 
-def merge_replicate_group(group: pd.DataFrame) -> dict:
+def _pooled_pvalue(
+    total_treat_G: int, total_treat_A: int,
+    ctrl_G: int, ctrl_A: int,
+    stat_test: str
+) -> float:
+    """Compute pooled p-value using the same test as the per-site caller."""
+    if stat_test == 'none':
+        return 0.0
+    elif stat_test == 'hypergeometric':
+        M = ctrl_A + ctrl_G
+        n = ctrl_G
+        N = total_treat_A + total_treat_G
+        k = total_treat_G
+        try:
+            if k == 0:
+                return 1.0
+            if N <= M and M > 0:
+                return float(stats.hypergeom.sf(k - 1, M, n, N))
+            else:
+                bg_rate = n / M if M > 0 else 0.0
+                return float(stats.binom.sf(k - 1, N, bg_rate)) if bg_rate > 0 else 1.0
+        except Exception:
+            return 1.0
+    else:  # fisher
+        try:
+            _, p_value = stats.fisher_exact(
+                [[total_treat_G, total_treat_A],
+                 [ctrl_G, ctrl_A]],
+                alternative='greater'
+            )
+            return p_value
+        except Exception:
+            return 1.0
+
+
+def merge_replicate_group(group: pd.DataFrame, stat_test: str = 'fisher') -> dict:
     """
     Merge per-replicate rows at the same genomic position into one consensus row.
 
     Control counts are identical across replicates (merged control). Treatment
     counts are summed across replicates to produce pooled statistics, and the
-    Fisher's exact test is re-run on the pooled table.
+    significance test is re-run on the pooled table using the same method
+    specified by stat_test ('fisher', 'hypergeometric', or 'none').
     """
     first = group.iloc[0]
 
-    # Pool treatment nucleotide counts across replicates
     total_treat_A = int(group['treatment_A'].sum())
     total_treat_G = int(group['treatment_G'].sum())
     total_treat_cov = int(group['treatment_cov'].sum())
 
-    # Control counts are the same for all rows at this position
     ctrl_A = int(first['control_A'])
     ctrl_G = int(first['control_G'])
     ctrl_cov = int(first['control_cov'])
 
-    # Recalculate editing frequency from pooled counts
     denominator = total_treat_A + total_treat_G
     edit_freq = (total_treat_G / denominator * 100.0) if denominator > 0 else 0.0
 
-    # Recalculate fold change
     ctrl_rate = ctrl_G / ctrl_A if ctrl_A > 0 else 0.0
     treat_rate = total_treat_G / total_treat_A if total_treat_A > 0 else 0.0
     fold_change = treat_rate / ctrl_rate if ctrl_rate > 0 else float('inf')
 
-    # Re-run Fisher's exact test on pooled contingency table
-    try:
-        _, p_value = stats.fisher_exact(
-            [[total_treat_G, total_treat_A],
-             [ctrl_G, ctrl_A]],
-            alternative='greater'
-        )
-    except Exception:
-        p_value = 1.0
+    p_value = _pooled_pvalue(total_treat_G, total_treat_A, ctrl_G, ctrl_A, stat_test)
 
     return {
         'chr':          first['chr'],
@@ -115,7 +139,10 @@ def merge_replicate_group(group: pd.DataFrame) -> dict:
     }
 
 
-def filter_replicates(input_file: str, min_replicates: int, output_file: str) -> None:
+def filter_replicates(
+    input_file: str, min_replicates: int, output_file: str,
+    stat_test: str = 'fisher'
+) -> None:
     logger.info(f"Loading raw editing sites: {input_file}")
     df = load_bed(input_file)
     logger.info(f"  {len(df):,} raw site-replicate rows loaded")
@@ -161,7 +188,7 @@ def filter_replicates(input_file: str, min_replicates: int, output_file: str) ->
 
     merged_rows = []
     for (chrom, start), group in df_keep.groupby(['chr', 'start'], sort=False):
-        merged_rows.append(merge_replicate_group(group))
+        merged_rows.append(merge_replicate_group(group, stat_test=stat_test))
 
     out = pd.DataFrame(merged_rows)
     out = out.sort_values(['chr', 'start']).reset_index(drop=True)
@@ -196,6 +223,10 @@ def main():
                         help='Minimum number of replicates a site must appear in (default: 2)')
     parser.add_argument('--output', required=True,
                         help='Output filtered BED file')
+    parser.add_argument('--stat-test', default='fisher',
+                        choices=['fisher', 'hypergeometric', 'none'],
+                        help='Statistical test for pooled significance (must match '
+                             'the test used in call_editing_sites_parallel.py; default: fisher)')
     args = parser.parse_args()
 
     logger.info('=' * 60)
@@ -203,9 +234,10 @@ def main():
     logger.info('=' * 60)
     logger.info(f'Input:           {args.input}')
     logger.info(f'Min replicates:  {args.min_replicates}')
+    logger.info(f'Stat test:       {args.stat_test}')
     logger.info(f'Output:          {args.output}')
 
-    filter_replicates(args.input, args.min_replicates, args.output)
+    filter_replicates(args.input, args.min_replicates, args.output, args.stat_test)
 
     logger.info('=' * 60)
     logger.info('Replicate filtering complete!')

@@ -340,7 +340,9 @@ rule call_editing_sites:
         min_edit_freq = config.get("min_edit_freq", 0.05),
         edit_fold_change = config.get("edit_fold_change", 2.0),
         p_threshold = config.get("p_value_threshold", 0.05),
-        chunk_size = config.get("chunk_size", 10000000)
+        chunk_size = config.get("chunk_size", 10000000),
+        stat_test = config.get("stat_test", "fisher"),
+        min_site_distance = config.get("min_site_distance", 0),
     threads: config.get("calling_threads", 16)
     log: "logs/call_editing_sites.log"
     shell:
@@ -355,6 +357,8 @@ rule call_editing_sites:
             --min-edit-freq {params.min_edit_freq} \
             --edit-fold-change {params.edit_fold_change} \
             --p-value-threshold {params.p_threshold} \
+            --stat-test {params.stat_test} \
+            --min-site-distance {params.min_site_distance} \
             2> {log}
         """
 
@@ -373,13 +377,15 @@ rule filter_replicates:
     output:
         "results/filtered_editing_sites.bed"
     params:
-        min_replicates = config.get("min_replicates", 2)
+        min_replicates = config.get("min_replicates", 2),
+        stat_test = config.get("stat_test", "fisher"),
     log: "logs/filter_replicates.log"
     shell:
         """
         python {SCRIPTS_DIR}/filter_replicates.py \
             --input {input} \
             --min-replicates {params.min_replicates} \
+            --stat-test {params.stat_test} \
             --output {output} \
             2> {log}
         """

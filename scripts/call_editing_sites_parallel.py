@@ -149,40 +149,60 @@ def get_base_counts_at_position(
 
 def calculate_editing_statistics(
     control_counts: BaseCount,
-    treatment_counts: BaseCount
+    treatment_counts: BaseCount,
+    stat_test: str = 'fisher'
 ) -> Tuple[float, float, float]:
     """
     Calculate editing frequency, fold change, and statistical significance.
-    
-    Args:
-        control_counts: Base counts from control sample
-        treatment_counts: Base counts from treatment sample
-        
-    Returns:
-        Tuple of (editing_frequency, fold_change, p_value)
+
+    stat_test options:
+      'fisher'        - one-sided Fisher's exact test on 2x2 contingency table
+      'hypergeometric'- hypergeometric sampling model (treat reads drawn from
+                        control-defined background; falls back to binomial when
+                        treatment depth exceeds control depth)
+      'none'          - no statistical test; p_value set to 0.0 so all sites
+                        passing frequency/fold-change thresholds are retained
     """
-    # Calculate editing frequencies
     control_edit = (control_counts.G / control_counts.A) if control_counts.A > 0 else 0
     treatment_edit = (treatment_counts.G / treatment_counts.A) if treatment_counts.A > 0 else 0
-    
-    # Editing frequency as percentage
     edit_freq = treatment_edit * 100
-    
-    # Fold change
     fold_change = treatment_edit / control_edit if control_edit > 0 else float('inf')
-    
-    # Fisher's exact test for significance
-    # Contingency table: [[treatment_G, treatment_A], [control_G, control_A]]
-    contingency_table = [
-        [treatment_counts.G, treatment_counts.A],
-        [control_counts.G, control_counts.A]
-    ]
-    
-    try:
-        _, p_value = stats.fisher_exact(contingency_table, alternative='greater')
-    except:
-        p_value = 1.0
-    
+
+    if stat_test == 'none':
+        p_value = 0.0
+
+    elif stat_test == 'hypergeometric':
+        # Hypergeometric: P(X >= treat_G) where X ~ Hypergeom(M, n, N)
+        #   M = control total reads (population size)
+        #   n = control G reads     (successes in population)
+        #   N = treatment total reads (draw size)
+        #   k = treatment G reads     (observed successes)
+        # Falls back to binomial when N > M (treatment depth exceeds control).
+        M = control_counts.A + control_counts.G
+        n = control_counts.G
+        N = treatment_counts.A + treatment_counts.G
+        k = treatment_counts.G
+        try:
+            if k == 0:
+                p_value = 1.0
+            elif N <= M and M > 0:
+                p_value = float(stats.hypergeom.sf(k - 1, M, n, N))
+            else:
+                bg_rate = n / M if M > 0 else 0.0
+                p_value = float(stats.binom.sf(k - 1, N, bg_rate)) if bg_rate > 0 else 1.0
+        except Exception:
+            p_value = 1.0
+
+    else:  # fisher (default)
+        contingency_table = [
+            [treatment_counts.G, treatment_counts.A],
+            [control_counts.G,   control_counts.A],
+        ]
+        try:
+            _, p_value = stats.fisher_exact(contingency_table, alternative='greater')
+        except Exception:
+            p_value = 1.0
+
     return edit_freq, fold_change, p_value
 
 
@@ -254,7 +274,8 @@ def process_chromosome_chunk(args) -> List[EditingSite]:
             
             # Calculate statistics
             edit_freq, fold_change, p_value = calculate_editing_statistics(
-                merged_control, treatment_counts
+                merged_control, treatment_counts,
+                stat_test=params.get('stat_test', 'fisher')
             )
             
             # Apply filters
@@ -311,6 +332,36 @@ def get_chromosome_chunks(
     return chunks
 
 
+def _apply_min_site_distance(
+    sites: List[EditingSite], min_dist: int
+) -> List[EditingSite]:
+    """
+    Remove sites closer than min_dist nt to an adjacent retained site.
+    Sites must already be sorted by (chromosome, position).
+    When two sites are within min_dist, the one with the higher p_value is dropped;
+    ties are broken by keeping the site with the higher fold_change.
+    """
+    if not sites:
+        return sites
+    kept: List[EditingSite] = []
+    last_chrom: Optional[str] = None
+    last_pos: int = -min_dist - 1
+    for site in sites:
+        if site.chromosome != last_chrom or (site.position - last_pos) >= min_dist:
+            kept.append(site)
+            last_chrom = site.chromosome
+            last_pos = site.position
+        else:
+            # Replace last kept site if current site is more significant
+            prev = kept[-1]
+            if site.p_value < prev.p_value or (
+                site.p_value == prev.p_value and site.fold_change > prev.fold_change
+            ):
+                kept[-1] = site
+                last_pos = site.position
+    return kept
+
+
 def main():
     """Main function to run the editing site caller"""
     parser = argparse.ArgumentParser(
@@ -351,7 +402,19 @@ def main():
                        help='Minimum base quality score (default: 20)')
     parser.add_argument('--min-mapping-quality', type=int, default=10,
                        help='Minimum read mapping quality (default: 10)')
-    
+
+    # Statistical test
+    parser.add_argument('--stat-test', default='fisher',
+                       choices=['fisher', 'hypergeometric', 'none'],
+                       help='Statistical test for significance (default: fisher). '
+                            '"none" retains all sites passing freq/fold-change thresholds.')
+
+    # Proximity filter
+    parser.add_argument('--min-site-distance', type=int, default=0,
+                       help='Minimum distance (nt) between adjacent called sites. '
+                            'When two sites are closer than this, the lower-confidence '
+                            'site (higher p-value) is dropped. 0 = disabled (default: 0).')
+
     args = parser.parse_args()
     
     # Validate input files
@@ -382,6 +445,10 @@ def main():
     )
     logger.info(f"Created {len(chunks)} chunks for processing")
     
+    logger.info(f"Stat test:        {args.stat_test}")
+    logger.info(f"Min site distance: {args.min_site_distance} nt "
+                f"({'disabled' if args.min_site_distance == 0 else 'active'})")
+
     # Prepare parameters for workers
     params = {
         'min_coverage': args.min_coverage,
@@ -389,7 +456,8 @@ def main():
         'edit_fold_change': args.edit_fold_change,
         'p_value_threshold': args.p_value_threshold,
         'min_base_quality': args.min_base_quality,
-        'min_mapping_quality': args.min_mapping_quality
+        'min_mapping_quality': args.min_mapping_quality,
+        'stat_test': args.stat_test,
     }
     
     # Prepare arguments for each chunk
@@ -412,8 +480,17 @@ def main():
             chunk_sites = process_chromosome_chunk(chunk_arg)
             all_editing_sites.extend(chunk_sites)
     
-    logger.info(f"Total editing sites found: {len(all_editing_sites)}")
-    
+    logger.info(f"Total editing sites found (pre-distance filter): {len(all_editing_sites)}")
+
+    # Apply minimum inter-site distance filter (global, after sorting)
+    if args.min_site_distance > 0:
+        all_editing_sites = _apply_min_site_distance(
+            all_editing_sites, args.min_site_distance
+        )
+        logger.info(
+            f"After {args.min_site_distance}-nt distance filter: {len(all_editing_sites)} sites"
+        )
+
     # Write results
     logger.info(f"Writing results to {args.output}")
     with open(args.output, 'w') as out:
