@@ -36,8 +36,14 @@ logging.basicConfig(level=logging.INFO,
 logger = logging.getLogger(__name__)
 
 sns.set_style('whitegrid')
-plt.rcParams.update({'figure.dpi':150,'savefig.dpi':300,
-                     'font.size':11,'axes.titlesize':12,'axes.labelsize':11})
+plt.rcParams.update({
+    'figure.dpi': 150, 'savefig.dpi': 300,
+    'font.family': 'sans-serif',
+    'font.sans-serif': ['Arial', 'Helvetica', 'DejaVu Sans'],
+    'pdf.fonttype': 42,
+    'svg.fonttype': 'none',
+    'font.size': 11, 'axes.titlesize': 12, 'axes.labelsize': 11,
+})
 
 _CPAL = {'WT':'#2980b9','S161':'#e74c3c','S206':'#27ae60','Both':'#8e44ad'}
 

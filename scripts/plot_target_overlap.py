@@ -51,6 +51,10 @@ logger = logging.getLogger(__name__)
 sns.set_style('whitegrid')
 plt.rcParams.update({
     'figure.dpi': 150, 'savefig.dpi': 300,
+    'font.family': 'sans-serif',
+    'font.sans-serif': ['Arial', 'Helvetica', 'DejaVu Sans'],
+    'pdf.fonttype': 42,
+    'svg.fonttype': 'none',
     'font.size': 11, 'axes.titlesize': 12, 'axes.labelsize': 11,
 })
 
