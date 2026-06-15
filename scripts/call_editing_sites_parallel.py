@@ -206,96 +206,112 @@ def calculate_editing_statistics(
     return edit_freq, fold_change, p_value
 
 
+def _pileup_base_counts(
+    bam_paths: List[str],
+    chromosome: str,
+    start: int,
+    end: int,
+    min_base_quality: int,
+    min_mapping_quality: int,
+) -> Dict[int, BaseCount]:
+    """
+    Single-pass pileup over all BAMs for a genomic chunk.
+    Returns merged BaseCount per covered position.
+    Opening each BAM once per chunk is far cheaper than random-access per position.
+    """
+    merged: Dict[int, BaseCount] = defaultdict(BaseCount)
+    for bam_path in bam_paths:
+        try:
+            with pysam.AlignmentFile(bam_path, "rb") as bam:
+                for col in bam.pileup(
+                    chromosome, start, end,
+                    min_base_quality=min_base_quality,
+                    min_mapping_quality=min_mapping_quality,
+                    stepper='nofilter',
+                    truncate=True,
+                ):
+                    pos = col.reference_pos
+                    bc = merged[pos]
+                    for pr in col.pileups:
+                        if pr.is_del or pr.is_refskip:
+                            continue
+                        base = pr.alignment.query_sequence[pr.query_position]
+                        if base == 'A':
+                            bc.A += 1
+                        elif base == 'C':
+                            bc.C += 1
+                        elif base == 'G':
+                            bc.G += 1
+                        elif base == 'T':
+                            bc.T += 1
+                        else:
+                            bc.N += 1
+        except (ValueError, KeyError):
+            # Chromosome not present in this BAM (e.g. chrY in female sample)
+            pass
+    return merged
+
+
 def process_chromosome_chunk(args) -> List[EditingSite]:
     """
-    Process a chunk of positions on a chromosome.
-    
-    This function is designed to be called by multiprocessing.Pool.
-    
-    Args:
-        args: Tuple containing (chromosome, start, end, control_bams, 
-              treatment_bams, params)
-              
-    Returns:
-        List of EditingSite objects
+    Process all covered positions in a chromosome chunk.
+    Uses a single pileup pass per BAM rather than per-position random access,
+    so every A-covered position is examined (not a 100-bp subsample).
     """
     chromosome, start, end, control_bams, treatment_bams, params = args
-    
+
     logger.info(f"Processing {chromosome}:{start}-{end}")
-    
+
+    min_bq = params['min_base_quality']
+    min_mq = params['min_mapping_quality']
+    min_cov = params['min_coverage']
+
+    # ── Merge control counts across all control BAMs in one pass ─────────────
+    ctrl_counts = _pileup_base_counts(control_bams, chromosome, start, end, min_bq, min_mq)
+
+    # ── Pre-filter to positions with adequate A-dominant control coverage ─────
+    candidate_positions = {
+        pos: bc
+        for pos, bc in ctrl_counts.items()
+        if bc.total >= min_cov
+        and bc.A >= min_cov * 0.5
+        and (bc.G / bc.A if bc.A > 0 else 0) <= params['max_control_edit_freq']
+    }
+
+    if not candidate_positions:
+        return []
+
+    # ── Pileup each treatment BAM once; only score candidate positions ────────
     editing_sites = []
-    
-    # Sample positions (full iteration would check every position)
-    # For efficiency, we only check positions with coverage
-    # This is a simplified version - full implementation would use pileup
-    
-    for position in range(start, end, 100):  # Sample every 100bp for demo
-        # Get base counts from all control samples
-        control_counts_all = []
-        for bam in control_bams:
-            counts = get_base_counts_at_position(
-                bam, chromosome, position,
-                params['min_base_quality'],
-                params['min_mapping_quality']
-            )
-            if counts.total > 0:
-                control_counts_all.append(counts)
-        
-        if not control_counts_all:
-            continue
-        
-        # Merge control counts
-        merged_control = BaseCount()
-        for counts in control_counts_all:
-            merged_control.A += counts.A
-            merged_control.C += counts.C
-            merged_control.G += counts.G
-            merged_control.T += counts.T
-            merged_control.N += counts.N
-        
-        # Skip if insufficient control coverage
-        if merged_control.total < params['min_coverage']:
-            continue
-            
-        # Only consider positions with A in control
-        if merged_control.A < params['min_coverage'] * 0.5:
-            continue
-        
-        # Process each treatment sample
-        for treatment_bam in treatment_bams:
-            treatment_counts = get_base_counts_at_position(
-                treatment_bam, chromosome, position,
-                params['min_base_quality'],
-                params['min_mapping_quality']
-            )
-            
-            if treatment_counts.total < params['min_coverage']:
+    for treat_bam in treatment_bams:
+        treat_counts = _pileup_base_counts([treat_bam], chromosome, start, end, min_bq, min_mq)
+
+        for pos, ctrl_bc in candidate_positions.items():
+            treat_bc = treat_counts.get(pos, BaseCount())
+            if treat_bc.total < min_cov:
                 continue
-            
-            # Calculate statistics
+
             edit_freq, fold_change, p_value = calculate_editing_statistics(
-                merged_control, treatment_counts,
-                stat_test=params.get('stat_test', 'fisher')
+                ctrl_bc, treat_bc, stat_test=params.get('stat_test', 'fisher')
             )
-            
-            # Apply filters
-            if (edit_freq >= params['min_edit_freq'] * 100 and
-                fold_change >= params['edit_fold_change'] and
-                p_value < params['p_value_threshold']):
-                
-                site = EditingSite(
+
+            ctrl_edit_rate = ctrl_bc.G / ctrl_bc.A if ctrl_bc.A > 0 else 0
+            if (edit_freq >= params['min_edit_freq'] * 100
+                    and (params['edit_fold_change'] == 0 or fold_change >= params['edit_fold_change'])
+                    and ctrl_edit_rate <= params['max_control_edit_freq']
+                    and p_value < params['p_value_threshold']):
+                editing_sites.append(EditingSite(
                     chromosome=chromosome,
-                    position=position,
+                    position=pos,
                     strand='.',
                     gene='.',
-                    control_count=merged_control,
-                    treatment_count=treatment_counts,
+                    control_count=ctrl_bc,
+                    treatment_count=treat_bc,
                     edit_frequency=edit_freq,
                     fold_change=fold_change,
-                    p_value=p_value
-                )
-                editing_sites.append(site)
-    
+                    p_value=p_value,
+                ))
+
     logger.info(f"Found {len(editing_sites)} sites in {chromosome}:{start}-{end}")
     return editing_sites
 
@@ -347,7 +363,9 @@ def _apply_min_site_distance(
     last_chrom: Optional[str] = None
     last_pos: int = -min_dist - 1
     for site in sites:
-        if site.chromosome != last_chrom or (site.position - last_pos) >= min_dist:
+        # Same position = different replicate calling the same site; always keep
+        same_pos = (site.chromosome == last_chrom and site.position == last_pos)
+        if same_pos or site.chromosome != last_chrom or (site.position - last_pos) >= min_dist:
             kept.append(site)
             last_chrom = site.chromosome
             last_pos = site.position
@@ -393,7 +411,11 @@ def main():
     parser.add_argument('--min-edit-freq', type=float, default=0.05,
                        help='Minimum editing frequency (default: 0.05)')
     parser.add_argument('--edit-fold-change', type=float, default=2.0,
-                       help='Minimum fold change vs control (default: 2.0)')
+                       help='Minimum fold change vs control (default: 2.0). '
+                            'Set to 0 to disable.')
+    parser.add_argument('--max-control-edit-freq', type=float, default=1.0,
+                       help='Maximum editing frequency allowed in control (default: 1.0 = disabled). '
+                            'Set e.g. 0.1 to require <10%% control editing (original TRIBE approach).')
     parser.add_argument('--p-value-threshold', type=float, default=0.05,
                        help='P-value threshold for significance (default: 0.05)')
     
@@ -434,7 +456,8 @@ def main():
     logger.info(f"Threads: {args.threads}")
     logger.info(f"Min coverage: {args.min_coverage}")
     logger.info(f"Min editing frequency: {args.min_edit_freq}")
-    logger.info(f"Min fold change: {args.edit_fold_change}")
+    logger.info(f"Min fold change: {args.edit_fold_change} ({'disabled' if args.edit_fold_change == 0 else 'active'})")
+    logger.info(f"Max control edit freq: {args.max_control_edit_freq} ({'disabled' if args.max_control_edit_freq >= 1.0 else 'active'})")
     
     # Get chromosome chunks for parallel processing
     logger.info("Dividing genome into chunks...")
@@ -454,6 +477,7 @@ def main():
         'min_coverage': args.min_coverage,
         'min_edit_freq': args.min_edit_freq,
         'edit_fold_change': args.edit_fold_change,
+        'max_control_edit_freq': args.max_control_edit_freq,
         'p_value_threshold': args.p_value_threshold,
         'min_base_quality': args.min_base_quality,
         'min_mapping_quality': args.min_mapping_quality,
