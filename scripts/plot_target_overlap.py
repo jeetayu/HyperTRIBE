@@ -187,6 +187,12 @@ def _run_go(gene_set: Set[str], label: str, background: Set[str]) -> pd.DataFram
 
 
 def run_go_analysis(sets: List[Set[str]], labels: List[str]) -> pd.DataFrame:
+    # Single-set mode: GO enrichment on all genes in the one set
+    if len(sets) == 1:
+        logger.info("Running GO enrichment analysis (single dataset)...")
+        df = _run_go(sets[0], labels[0], sets[0])
+        return df
+
     logger.info("Running GO enrichment analysis via g:Profiler...")
     background = sets[0] | sets[1] | sets[2]
 
@@ -312,6 +318,89 @@ def _panel_editcount(ax, sets: List[Set[str]], labels: List[str], edit_counts: L
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Single-dataset summary figure
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _plot_single(genes: Set[str], label: str, output: str,
+                 go_output: str, skip_go: bool = False):
+    """Summary figure + GO enrichment for a single gene set (no Venn)."""
+    logger.info(f"Single-dataset mode: {label} ({len(genes):,} genes)")
+
+    go_df = pd.DataFrame()
+    if not skip_go:
+        go_df = run_go_analysis([genes], [label])
+        if not go_df.empty and go_output:
+            Path(go_output).parent.mkdir(parents=True, exist_ok=True)
+            go_df.to_csv(go_output, sep='\t', index=False)
+            logger.info(f"GO table saved: {go_output}")
+
+    source_order = {'GO:BP': 0, 'GO:MF': 1, 'GO:CC': 2, 'KEGG': 3, 'REAC': 4}
+    source_colors = {'GO:BP': '#3498db', 'GO:MF': '#e74c3c',
+                     'GO:CC': '#2ecc71', 'KEGG': '#e67e22', 'REAC': '#9b59b6'}
+
+    top_sources: List[str] = []
+    if not go_df.empty:
+        top_sources = sorted(go_df['source'].unique(),
+                             key=lambda s: source_order.get(s, 99))[:4]
+
+    n_panels = max(len(top_sources), 1)
+    n_rows = 1 + (n_panels + 1) // 2
+    fig = plt.figure(figsize=(16, 5 * n_rows))
+    gs = gridspec.GridSpec(n_rows, 2, figure=fig, hspace=0.6, wspace=0.4)
+
+    ax_summary = fig.add_subplot(gs[0, :])
+    ax_summary.axis('off')
+    summary_text = f"{label} HyperTRIBE Targets: {len(genes):,} genes"
+    if not go_df.empty:
+        summary_text += f"\n{len(go_df):,} significant GO/pathway terms"
+    ax_summary.text(0.5, 0.5, summary_text,
+                    ha='center', va='center', fontsize=16, fontweight='bold',
+                    transform=ax_summary.transAxes,
+                    bbox=dict(boxstyle='round,pad=0.5', facecolor='#ecf0f1', alpha=0.8))
+
+    if top_sources:
+        for idx, source in enumerate(top_sources):
+            row = 1 + idx // 2
+            col = idx % 2
+            ax_go = fig.add_subplot(gs[row, col])
+            sub = go_df[go_df['source'] == source].nsmallest(15, 'p_value').copy()
+            sub['-log10p'] = -np.log10(sub['p_value'].clip(lower=1e-300))
+            sub = sub.sort_values('-log10p')
+            ax_go.barh(range(len(sub)), sub['-log10p'],
+                       color=source_colors.get(source, '#888'),
+                       edgecolor='white', linewidth=0.4)
+            ax_go.set_yticks(range(len(sub)))
+            ax_go.set_yticklabels(
+                [f"{n[:55]}…" if len(n) > 55 else n for n in sub['name']],
+                fontsize=8)
+            ax_go.set_xlabel('−log₁₀(FDR)')
+            ax_go.set_title(f'GO — {source}', fontsize=11, fontweight='bold')
+            ax_go.axvline(x=-np.log10(0.05), color='#e74c3c', linestyle='--',
+                          linewidth=0.8, alpha=0.8)
+            ax_go.spines['top'].set_visible(False)
+            ax_go.spines['right'].set_visible(False)
+    else:
+        ax_empty = fig.add_subplot(gs[1, :])
+        ax_empty.text(0.5, 0.5, 'No significant GO/pathway terms found',
+                      ha='center', va='center', transform=ax_empty.transAxes,
+                      fontsize=12, color='#888')
+        ax_empty.axis('off')
+
+    fig.suptitle(f"HyperTRIBE — {label} Target Gene GO Enrichment",
+                 fontsize=15, fontweight='bold', y=1.002)
+    Path(output).parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(output, bbox_inches='tight')
+    plt.close()
+    logger.info(f"Saved: {output}")
+
+    logger.info(f"\nTop target genes ({label}):")
+    for g in sorted(genes)[:50]:
+        logger.info(f"  {g}")
+    if len(genes) > 50:
+        logger.info(f"  ... and {len(genes) - 50} more (see GO output)")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main plot
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -321,6 +410,10 @@ def plot(input_files: List[str], labels: List[str], output: str,
     sets = [_load_genes(f) for f in input_files]
     for label, s in zip(labels, sets):
         logger.info(f"  {label}: {len(s):,} target genes")
+
+    if len(sets) == 1:
+        _plot_single(sets[0], labels[0], output, go_output, skip_go)
+        return
 
     core = sets[0] & sets[1] & sets[2]
     logger.info(f"  Core (all 3): {len(core):,} genes")
@@ -398,8 +491,8 @@ def main():
     labels = args.labels or [Path(f).stem for f in args.input]
     if len(labels) != len(args.input):
         parser.error('--labels must have same count as --input')
-    if len(args.input) != 3:
-        parser.error('Exactly 3 input files required for 3-way Venn')
+    if len(args.input) not in (1, 3):
+        parser.error('Either 1 input file (GO enrichment only) or exactly 3 (3-way Venn) required')
 
     plot(args.input, labels, args.output, args.go_output, args.skip_go)
 

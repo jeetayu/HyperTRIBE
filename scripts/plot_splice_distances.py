@@ -44,7 +44,6 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import seaborn as sns
-from scipy.stats import gaussian_kde
 
 logging.basicConfig(
     level=logging.INFO,
@@ -134,6 +133,188 @@ def _panel_intronic_breakdown(ax, dfs, labels):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Intronic distance panels
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _panel_ecdf(ax, dfs, labels):
+    """ECDF of minimum distance to nearest splice site (intronic sites only)."""
+    from matplotlib.lines import Line2D
+
+    line_handles = []
+    for df, label, color in zip(dfs, labels, _COND_PALETTE):
+        intr = df[df['feature_type'] == 'intron']
+        d5 = intr['signed_5ss'].dropna()          # positive for intronic
+        d3 = (-intr['signed_3ss']).dropna()       # |signed_3ss|, positive
+        idx = d5.index.intersection(d3.index)
+        min_dist = pd.concat([d5.loc[idx], d3.loc[idx]], axis=1).min(axis=1)
+        min_dist = min_dist[min_dist > 0].sort_values()
+        ecdf = np.arange(1, len(min_dist) + 1) / len(min_dist)
+        h, = ax.semilogx(min_dist.values, ecdf * 100, color=color,
+                         linewidth=2.0, alpha=0.9,
+                         label=f'{label} (n={len(min_dist):,})')
+        line_handles.append(h)
+
+    ref_lines = [(8, '5\'SS proximal\n(8 nt)', '#e74c3c', 20),
+                 (50, 'PPT region\n(50 nt)', '#f39c12', 35),
+                 (300, '300 nt', '#888', 50)]
+    for d, lbl, lc, ypos in ref_lines:
+        ax.axvline(d, color=lc, linewidth=1.0, linestyle='--', alpha=0.6)
+        ax.text(d * 1.15, ypos, lbl, fontsize=7, color=lc, va='bottom')
+
+    ax.set_xlabel('Distance to nearest splice site (nt, log scale)')
+    ax.set_ylabel('Cumulative % of intronic sites')
+    ax.set_title('ECDF: Distance to Nearest Splice Element\n(intronic sites only)')
+    ax.legend(handles=line_handles, fontsize=9, frameon=True,
+              title='Condition', title_fontsize=9)
+    ax.set_ylim(0, 100)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+
+
+def _panel_violin_3ss(ax, dfs, labels):
+    """Violin of log10(|signed_3ss|) for intronic sites, one violin per condition."""
+    from matplotlib.lines import Line2D
+
+    log_data = []
+    for df in dfs:
+        intr = df[df['feature_type'] == 'intron']
+        d3 = (-intr['signed_3ss']).dropna()
+        d3 = d3[d3 > 0]
+        log_data.append(np.log10(d3.values))
+
+    parts = ax.violinplot(log_data, positions=range(len(labels)),
+                          showmedians=True, showextrema=True, widths=0.65)
+    for body, color in zip(parts['bodies'], _COND_PALETTE):
+        body.set_facecolor(color)
+        body.set_edgecolor('white')
+        body.set_alpha(0.75)
+    parts['cmedians'].set_color('black')
+    parts['cmedians'].set_linewidth(2.5)
+    for key in ('cmins', 'cmaxes', 'cbars'):
+        parts[key].set_color('#999')
+        parts[key].set_linewidth(1.0)
+
+    # PPT landmark reference lines (log10 scale)
+    landmarks = [(4,  'PPT end (4 nt)',    '#e74c3c'),
+                 (50, 'PPT start (50 nt)', '#f39c12')]
+    landmark_handles = []
+    for d, lbl, lc in landmarks:
+        ax.axhline(np.log10(d), color=lc, linewidth=1.2, linestyle='--', alpha=0.75)
+        landmark_handles.append(Line2D([0], [0], color=lc, linewidth=1.2,
+                                       linestyle='--', label=lbl))
+
+    ax.set_xticks(range(len(labels)))
+    ax.set_xticklabels(labels, fontsize=10)
+    nice = [1, 5, 10, 50, 100, 500, 1000, 5000, 10000, 50000]
+    ymax_data = max(d.max() for d in log_data)
+    nice = [t for t in nice if np.log10(t) <= ymax_data + 0.1]
+    ax.set_yticks([np.log10(t) for t in nice])
+    ax.set_yticklabels([str(t) for t in nice])
+    ax.set_ylabel("Distance to 3'SS acceptor (nt, log scale)")
+    ax.set_title("Distance to 3'SS Acceptor\n(intronic sites only, log scale)")
+    ax.legend(handles=landmark_handles, fontsize=8, frameon=True,
+              title='Landmarks', title_fontsize=8, loc='upper right')
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+
+
+def _panel_relative_intronic_pos(ax, dfs, labels):
+    """KDE of normalized intronic position: dist_5SS / (dist_5SS + dist_3SS)."""
+    from scipy.stats import gaussian_kde
+    from matplotlib.lines import Line2D
+
+    line_handles = []
+    for df, label, color in zip(dfs, labels, _COND_PALETTE):
+        intr = df[df['feature_type'] == 'intron']
+        d5 = intr['signed_5ss'].dropna()
+        d3 = (-intr['signed_3ss']).dropna()
+        idx = d5.index.intersection(d3.index)
+        d5, d3 = d5.loc[idx], d3.loc[idx]
+        mask = (d5 > 0) & (d3 > 0)
+        d5, d3 = d5[mask], d3[mask]
+        rel = d5 / (d5 + d3)
+
+        xs = np.linspace(0, 1, 500)
+        kde = gaussian_kde(rel.values, bw_method=0.08)
+        ys = kde(xs)
+        h, = ax.plot(xs, ys, color=color, linewidth=2.2, alpha=0.9,
+                     label=f'{label} (n={len(rel):,})')
+        line_handles.append(h)
+
+    mid_handle = Line2D([0], [0], color='black', linewidth=1.0,
+                        linestyle=':', label='midpoint (0.5)')
+    ax.axvline(0.5, color='black', linewidth=1.0, linestyle=':', alpha=0.5)
+    ax.set_xlabel("Relative intronic position  (0 = 5'SS donor  →  1 = 3'SS acceptor)")
+    ax.set_ylabel('Density')
+    ax.set_title('Normalized Position within Intron\n'
+                 '(= dist_to_5SS / intron_length; removes intron-length bias)')
+    ax.set_xlim(0, 1)
+    leg1 = ax.legend(handles=line_handles, fontsize=9, frameon=True,
+                     title='Condition', title_fontsize=9, loc='upper right')
+    ax.add_artist(leg1)
+    ax.legend(handles=[mid_handle], fontsize=8, frameon=False, loc='upper left')
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+
+
+def _panel_ppt_ecdf_zoom(ax, dfs, labels):
+    """Zoomed ECDF of distance to 3'SS for intronic sites (0–200 nt, linear).
+
+    Replaces the noisy step-histogram PPT panel with a smooth cumulative curve
+    that directly answers: what fraction of intronic sites fall within the PPT
+    or 3'SS-proximal zone?
+    """
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Patch
+
+    xmax = 200
+
+    line_handles = []
+    for df, label, color in zip(dfs, labels, _COND_PALETTE):
+        intr = df[df['feature_type'] == 'intron']
+        d3 = (-intr['signed_3ss']).dropna()
+        d3 = d3[d3 > 0].sort_values()
+        total = len(d3)
+        ecdf = np.arange(1, total + 1) / total
+        mask = d3.values <= xmax
+        h, = ax.plot(d3.values[mask], ecdf[mask] * 100, color=color,
+                     linewidth=2.0, alpha=0.9,
+                     label=f'{label} (n={total:,} intronic)')
+        line_handles.append(h)
+
+    # Shaded zones
+    landmark_handles = []
+    ax.axvspan(0,  4,  alpha=0.20, color='#e74c3c', zorder=0)
+    ax.axvspan(4,  50, alpha=0.15, color='#f1c40f', zorder=0)
+    landmark_handles.append(Patch(facecolor='#e74c3c', alpha=0.35,
+                                  edgecolor='none', label="3'SS proximal (≤4 nt)"))
+    landmark_handles.append(Patch(facecolor='#f1c40f', alpha=0.30,
+                                  edgecolor='none', label='PPT (4–50 nt)'))
+
+    for xv, lbl, lc in [(4,  '−4 nt',          '#e74c3c'),
+                         (27, 'PPT centre (−27)', '#c0a000'),
+                         (50, '−50 nt',           '#f39c12')]:
+        ax.axvline(xv, color=lc, linewidth=1.2, linestyle='--', alpha=0.85)
+        landmark_handles.append(Line2D([0], [0], color=lc, linewidth=1.2,
+                                       linestyle='--', label=lbl))
+
+    leg1 = ax.legend(handles=line_handles, fontsize=9, frameon=True,
+                     title='Condition', title_fontsize=9, loc='lower right')
+    ax.add_artist(leg1)
+    ax.legend(handles=landmark_handles, fontsize=8, frameon=True,
+              title='Landmarks', title_fontsize=8, loc='upper left', ncol=2)
+
+    ax.set_xlabel("Distance to 3'SS acceptor (nt)")
+    ax.set_ylabel("Cumulative % of all intronic sites")
+    ax.set_title("PPT / 3'SS Proximity — Cumulative Fraction (intronic sites)\n"
+                 "Zoom to 0–200 nt from 3'SS; y-axis is % of all intronic sites in each condition")
+    ax.set_xlim(0, xmax)
+    ax.set_ylim(0, None)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Metagene density plot helper
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -141,60 +322,70 @@ def _metagene(ax, dfs: List[pd.DataFrame], labels: List[str],
               col: str, title: str,
               xmin: int, xmax: int,
               shade_zones: Optional[list] = None,
-              vlines: Optional[list] = None):
+              vlines: Optional[list] = None,
+              intron_only: bool = False):
     """
     Signed-distance metagene plot.
-    col       : column name carrying the signed position values
-    xmin/xmax : x-axis range (nt)
-    shade_zones: list of (x0, x1, color, alpha, label)
-    vlines    : list of (x, color, label) dashed vertical lines
+    col         : column name carrying the signed position values
+    xmin/xmax   : x-axis range (nt)
+    shade_zones : list of (x0, x1, color, alpha, label)
+    vlines      : list of (x, color, label) dashed vertical lines
+    intron_only : if True, filter to feature_type == 'intron' before plotting
     """
-    bins = np.arange(xmin, xmax + 1, 5)
+    from matplotlib.patches import Patch
+    from matplotlib.lines import Line2D
 
-    all_counts = np.zeros(len(bins)-1)
+    bin_width = 2 if (xmax - xmin) <= 200 else 5
+    bins = np.arange(xmin, xmax + 1, bin_width)
+
+    line_handles = []
     for df, label, color in zip(dfs, labels, _COND_PALETTE):
-        vals = df[col].dropna()
+        src = df[df['feature_type'] == 'intron'] if intron_only else df
+        vals = src[col].dropna()
         vals = vals[(vals >= xmin) & (vals <= xmax)]
         if len(vals) < 5:
             continue
         counts, _ = np.histogram(vals, bins=bins)
-        all_counts += counts
-
-        # Normalised step histogram
-        ax.step(bins[:-1], counts / counts.sum() * 100,
-                where='mid', color=color, linewidth=1.6,
-                label=f'{label} (n={len(vals):,})', alpha=0.85)
-
-        # KDE overlay
-        kde = gaussian_kde(vals.values, bw_method=0.10)
-        xs  = np.linspace(xmin, xmax, 600)
-        kde_vals = kde(xs)
-        ax.plot(xs, kde_vals / kde_vals.sum() * len(bins) * 100,
-                color=color, linewidth=1.0, linestyle='--', alpha=0.5)
+        h, = ax.step(bins[:-1], counts / counts.sum() * 100,
+                     where='mid', color=color, linewidth=2.0,
+                     label=f'{label} (n={len(vals):,})', alpha=0.9)
+        line_handles.append(h)
 
     # Shaded functional zones
+    landmark_handles = []
     if shade_zones:
         for x0, x1, zc, za, zlabel in shade_zones:
-            ax.axvspan(x0, x1, alpha=za, color=zc, zorder=0, label=zlabel)
+            ax.axvspan(x0, x1, alpha=za, color=zc, zorder=0)
+            landmark_handles.append(Patch(facecolor=zc, alpha=min(za + 0.15, 1.0),
+                                          edgecolor='none', label=zlabel))
 
     # Functional landmark lines
-    ax.axvline(0, color='black', linewidth=1.8, linestyle='-', zorder=5, label='Splice site (0)')
+    ax.axvline(0, color='black', linewidth=2.0, linestyle='-', zorder=5)
+    landmark_handles.insert(0, Line2D([0], [0], color='black', linewidth=2.0,
+                                      label='Splice site (0)'))
     if vlines:
         for xv, vc, vl in vlines:
-            ax.axvline(xv, color=vc, linewidth=1.0, linestyle=':', alpha=0.8, label=vl)
+            ax.axvline(xv, color=vc, linewidth=1.2, linestyle='--', alpha=0.85)
+            landmark_handles.append(Line2D([0], [0], color=vc, linewidth=1.2,
+                                           linestyle='--', label=vl))
 
+    ylabel = (f'% of intronic sites per {bin_width}-nt bin' if intron_only
+              else f'% of sites per {bin_width}-nt bin')
     ax.set_xlabel('Position relative to splice element (nt)')
-    ax.set_ylabel('% of sites per 5-nt bin')
+    ax.set_ylabel(ylabel)
     ax.set_title(title)
-    ax.legend(fontsize=8, frameon=True, loc='upper right')
-    ax.spines['top'].set_visible(False); ax.spines['right'].set_visible(False)
-    ax.set_xlim(xmin, xmax)
 
-    # Annotate axis sides
-    ax.text(xmin * 0.92, ax.get_ylim()[1] * 0.92, '← upstream\n(5\' side)',
-            fontsize=8, color='#555', ha='left', va='top')
-    ax.text(xmax * 0.92, ax.get_ylim()[1] * 0.92, 'downstream →\n(3\' side)',
-            fontsize=8, color='#555', ha='right', va='top')
+    # Two separate legends: conditions (top-right) + landmarks (lower-right)
+    leg1 = ax.legend(handles=line_handles, fontsize=9, frameon=True,
+                     loc='upper right', title='Condition', title_fontsize=9)
+    ax.add_artist(leg1)
+    ax.legend(handles=landmark_handles, fontsize=8, frameon=True,
+              loc='lower right', title='Landmarks', title_fontsize=8,
+              ncol=2 if len(landmark_handles) > 4 else 1)
+
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.set_xlim(xmin, xmax)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -206,76 +397,64 @@ def plot(input_files: List[str], labels: List[str], output: str,
 
     dfs = [_load(f, l) for f, l in zip(input_files, labels)]
 
-    # Compute PPT-centre column: signed_3ss + PPT_CENTER_FROM_3SS
-    # → 0 = PPT centre, negative = further upstream, positive = toward 3'SS
-    for df in dfs:
-        df['signed_ppt'] = df['signed_3ss'] + PPT_CENTER_FROM_3SS
-
-    fig = plt.figure(figsize=(18, 24))
+    fig = plt.figure(figsize=(18, 38))
     from matplotlib.gridspec import GridSpec
-    gs = GridSpec(4, 2, figure=fig, hspace=0.52, wspace=0.35)
+    gs = GridSpec(6, 2, figure=fig, hspace=0.55, wspace=0.35,
+                  height_ratios=[1, 1, 1, 1.2, 1.2, 1.2])
 
-    ax_feat = fig.add_subplot(gs[0, 0])
-    ax_intr = fig.add_subplot(gs[0, 1])
-    ax_d5   = fig.add_subplot(gs[1, :])
-    ax_d3   = fig.add_subplot(gs[2, :])
-    ax_ppt  = fig.add_subplot(gs[3, :])
+    ax_feat   = fig.add_subplot(gs[0, 0])
+    ax_intr   = fig.add_subplot(gs[0, 1])
+    ax_ecdf   = fig.add_subplot(gs[1, 0])
+    ax_violin = fig.add_subplot(gs[1, 1])
+    ax_relpos = fig.add_subplot(gs[2, :])
+    ax_d5     = fig.add_subplot(gs[3, :])
+    ax_d3     = fig.add_subplot(gs[4, :])
+    ax_ppt    = fig.add_subplot(gs[5, :])
 
     _panel_feature_breakdown(ax_feat, dfs, labels)
     _panel_intronic_breakdown(ax_intr, dfs, labels)
+    _panel_ecdf(ax_ecdf, dfs, labels)
+    _panel_violin_3ss(ax_violin, dfs, labels)
+    _panel_relative_intronic_pos(ax_relpos, dfs, labels)
 
     # ── 5'SS metagene ──────────────────────────────────────────────────
     _metagene(
         ax_d5, dfs, labels, 'signed_5ss',
-        "Position Relative to 5' Splice Site (donor = 0)\n"
-        "negative = exonic (upstream),  positive = intronic (downstream)",
+        "Distance to 5' Splice Site Donor\n"
+        "negative = exonic  |  0 = donor  |  positive = intronic",
         xmin=-window_5ss, xmax=window_5ss,
         shade_zones=[
             (-window_5ss, 0,     '#3498db', 0.06, 'exon'),
-            (0,  8,              '#e74c3c', 0.12, f'5\'SS proximal (≤8 nt)'),
-            (0,  window_5ss,     '#e74c3c', 0.04, 'intron'),
+            (0,  8,              '#e74c3c', 0.15, '5\'SS proximal (≤8 nt)'),
+            (8,  window_5ss,     '#e74c3c', 0.04, 'intron'),
         ],
         vlines=[
-            (-3, '#888', 'exon -3'),
-            (8, '#e74c3c', '+8 nt (donor consensus end)'),
+            (-3, '#666', 'last exon codon (−3)'),
+            (8,  '#e74c3c', 'donor consensus end (+8)'),
         ]
     )
 
     # ── 3'SS metagene ──────────────────────────────────────────────────
     _metagene(
         ax_d3, dfs, labels, 'signed_3ss',
-        "Position Relative to 3' Splice Site (acceptor = 0)\n"
-        "negative = intronic (upstream / PPT region),  positive = exonic (downstream)",
+        "Distance to 3' Splice Site Acceptor\n"
+        "negative = intronic (PPT region)  |  0 = acceptor AG  |  positive = exonic",
         xmin=-window_3ss, xmax=window_3ss,
         shade_zones=[
-            (0,  window_3ss,     '#3498db', 0.06, 'exon'),
-            (-window_3ss, 0,     '#e67e22', 0.04, 'intron'),
-            (-50, -4,            '#f1c40f', 0.18, 'PPT (−50 to −4)'),
-            (-3,  0,             '#e74c3c', 0.18, '3\'SS proximal (AG, ≤3 nt)'),
+            (0,   window_3ss,    '#3498db', 0.06, 'exon'),
+            (-window_3ss, -50,   '#e67e22', 0.04, 'intron (deep)'),
+            (-50, -4,            '#f1c40f', 0.22, 'PPT (−50 to −4)'),
+            (-4,  0,             '#e74c3c', 0.22, '3\'SS proximal (−4 to 0)'),
         ],
         vlines=[
             (-50, '#f39c12', 'PPT start (−50)'),
             (-27, '#c0a000', 'PPT centre (−27)'),
-            (-4,  '#f39c12', 'PPT end (−4)'),
-            (-3,  '#e74c3c', '3\'SS proximal (−3)'),
+            (-4,  '#e74c3c', 'PPT/AG boundary (−4)'),
         ]
     )
 
-    # ── PPT-centre metagene ────────────────────────────────────────────
-    _metagene(
-        ax_ppt, dfs, labels, 'signed_ppt',
-        f"Position Relative to PPT Centre (−{PPT_CENTER_FROM_3SS} nt from 3'SS = 0)\n"
-        "negative = upstream (toward 5'SS),  positive = downstream (toward 3'SS / AG)",
-        xmin=-window_ppt, xmax=window_ppt,
-        shade_zones=[
-            (-23, +23, '#f1c40f', 0.18, 'PPT window (±23 nt from centre)'),
-            (+23, window_ppt, '#e74c3c', 0.12, 'Toward AG'),
-        ],
-        vlines=[
-            (+23, '#e74c3c', '3\'SS proximal zone'),
-            (-23, '#f39c12', 'PPT upstream edge'),
-        ]
-    )
+    # ── PPT / 3'SS proximity — zoomed cumulative fraction ─────────────
+    _panel_ppt_ecdf_zoom(ax_ppt, dfs, labels)
 
     fig.suptitle("HyperTRIBE — Editing Site Position Relative to Splice Elements",
                  fontsize=15, fontweight='bold', y=1.002)

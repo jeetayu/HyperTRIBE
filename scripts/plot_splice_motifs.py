@@ -47,12 +47,13 @@ import argparse
 import logging
 import random
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from scipy.stats import fisher_exact as _fisher_exact
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -483,6 +484,135 @@ def _draw_motif_enrichment(ax, edit_seqs: List[str], ctrl_seqs: List[str],
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# De novo k-mer enrichment
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _bh_fdr(p_values: np.ndarray) -> np.ndarray:
+    """Benjamini-Hochberg FDR correction; returns q-values."""
+    n = len(p_values)
+    order = np.argsort(p_values)
+    q = np.empty(n)
+    q[order] = p_values[order] * n / (np.arange(n) + 1)
+    # Enforce monotonicity from right
+    for i in range(n - 2, -1, -1):
+        q[order[i]] = min(q[order[i]], q[order[i + 1]])
+    return np.minimum(q, 1.0)
+
+
+def _kmer_enrichment(edit_seqs: List[str], ctrl_seqs: List[str],
+                     k: int = 6, min_count: int = 3) -> pd.DataFrame:
+    """Fisher exact enrichment of all k-mers in editing vs control sequences."""
+    edit_c, ctrl_c = Counter(), Counter()
+    for seq in edit_seqs:
+        if seq and 'N' not in seq:
+            for i in range(len(seq) - k + 1):
+                edit_c[seq[i:i + k]] += 1
+    for seq in ctrl_seqs:
+        if seq and 'N' not in seq:
+            for i in range(len(seq) - k + 1):
+                ctrl_c[seq[i:i + k]] += 1
+
+    edit_total = max(sum(edit_c.values()), 1)
+    ctrl_total = max(sum(ctrl_c.values()), 1)
+
+    rows = []
+    for kmer in set(edit_c) | set(ctrl_c):
+        e = edit_c.get(kmer, 0)
+        c = ctrl_c.get(kmer, 0)
+        if e < min_count:
+            continue
+        _, p = _fisher_exact([[e, edit_total - e], [c, ctrl_total - c]],
+                              alternative='greater')
+        fe = (e / edit_total) / max(c / ctrl_total, 1e-12)
+        rows.append({'kmer': kmer, 'edit_count': e, 'ctrl_count': c,
+                     'fold_enrichment': fe, 'p_value': p})
+
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    df['q_value'] = _bh_fdr(df['p_value'].values)
+    return df.sort_values('p_value').reset_index(drop=True)
+
+
+def _draw_kmer_enrichment(ax, edit_seqs: List[str], ctrl_seqs: List[str],
+                           k: int, title: str, n_top: int = 15):
+    """Horizontal bar chart of top enriched k-mers (FDR-corrected)."""
+    df = _kmer_enrichment(edit_seqs, ctrl_seqs, k=k)
+    if df.empty:
+        ax.text(0.5, 0.5, f'No enriched {k}-mers found\n(editing n={len(edit_seqs):,})',
+                ha='center', va='center', transform=ax.transAxes,
+                fontsize=10, color='grey')
+        ax.set_title(title)
+        return
+
+    top = df[df['fold_enrichment'] >= 1.2].head(n_top)
+    if top.empty:
+        ax.text(0.5, 0.5, f'No {k}-mers with ≥1.2× enrichment',
+                ha='center', va='center', transform=ax.transAxes)
+        ax.set_title(title)
+        return
+
+    cmap = plt.cm.YlOrRd
+    scores = np.log2(top['fold_enrichment'].values.clip(min=1e-3))
+    colors = cmap(np.interp(scores, [scores.min(), scores.max()], [0.25, 0.95]))
+
+    ax.barh(range(len(top)), top['fold_enrichment'].values,
+            color=colors, edgecolor='white', linewidth=0.3)
+    ax.set_yticks(range(len(top)))
+    ax.set_yticklabels(top['kmer'].values, fontfamily='monospace', fontsize=9)
+    ax.set_xlabel(f'Fold enrichment over control', fontsize=9)
+    ax.axvline(1.0, color='gray', linewidth=0.8, linestyle='--', alpha=0.6)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.invert_yaxis()  # most enriched at top
+
+    for i, (_, row) in enumerate(top.iterrows()):
+        q = row['q_value']
+        sig = '***' if q < 0.001 else ('**' if q < 0.01 else ('*' if q < 0.05 else ''))
+        ax.text(row['fold_enrichment'] + 0.03, i, sig, va='center', fontsize=8)
+
+    n_sig = int((df['q_value'] < 0.05).sum())
+    ax.set_title(f'{title}\n({n_sig}/{len(df)} {k}-mers FDR<5%; top {len(top)} shown)', fontsize=10)
+
+
+def _relative_entropy_logo(ax, edit_seqs: List[str], ctrl_seqs: List[str],
+                             title: str, xtick_labels: Optional[List[str]] = None):
+    """
+    Sequence logo showing per-base KL-divergence enrichment vs matched control.
+    Height at each position = Σ f_edit[b] × max(0, log2(f_edit[b] / f_ctrl[b])).
+    Only shows enrichment (depleted bases contribute 0), so the logo reads
+    'what does the RBP prefer here, relative to background'.
+    """
+    freq_edit = _seqs_to_pwm(edit_seqs, pseudo=0.1)
+    freq_ctrl = _seqs_to_pwm(ctrl_seqs, pseudo=0.1)
+    if freq_edit is None or freq_ctrl is None:
+        ax.text(0.5, 0.5, 'Insufficient sequences', ha='center', va='center',
+                transform=ax.transAxes, fontsize=10, color='grey')
+        ax.set_title(title)
+        return
+
+    ic = pd.DataFrame(0.0, index=freq_edit.index, columns=list('ACGT'))
+    for base in 'ACGT':
+        ratio = freq_edit[base].clip(lower=1e-9) / freq_ctrl[base].clip(lower=1e-9)
+        ic[base] = freq_edit[base] * np.log2(ratio).clip(lower=0)
+
+    n_edit = len([s for s in edit_seqs if s and 'N' not in s])
+    n_ctrl = len([s for s in ctrl_seqs if s and 'N' not in s])
+
+    logo = logomaker.Logo(ic, ax=ax, color_scheme='classic',
+                          baseline_width=0.5, alpha=0.85)
+    logo.style_spines(visible=False)
+    logo.style_spines(spines=['left', 'bottom'], visible=True)
+    ax.set_ylabel('KL bits\n(enrichment vs ctrl)', fontsize=9)
+
+    if xtick_labels:
+        ax.set_xticks(range(len(xtick_labels)))
+        ax.set_xticklabels(xtick_labels, fontsize=7)
+
+    ax.set_title(f'{title}\n(n_edit={n_edit:,}, n_ctrl={n_ctrl:,})', fontsize=10)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main analysis
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -650,7 +780,7 @@ def plot(input_file: str, fasta_file: str, gtf_file: str,
     logger.info(f"  branch-pt:{len(bp_edit):,} editing / {len(bp_ctrl):,} control")
 
     # ── Control sequences for motif enrichment scan ─────────────────────────
-    logger.info("Generating matched control sequences for motif scan...")
+    logger.info("Generating matched control sequences for de novo motif analysis...")
     ctrl_site_seqs = []
     edited_positions = set(zip(df['chr'], df['start']))
     for gene_id in set(df['gene_id'].dropna()):
@@ -666,12 +796,8 @@ def plot(input_file: str, fasta_file: str, gtf_file: str,
                 seq = _seq_around_site(fasta, chrom, pos1, strand, flank=15)
                 if seq and len(seq) == 31 and 'N' not in seq:
                     ctrl_site_seqs.append(seq)
-    ctrl_site_seqs = random.sample(ctrl_site_seqs, min(1000, len(ctrl_site_seqs)))
+    ctrl_site_seqs = random.sample(ctrl_site_seqs, min(2000, len(ctrl_site_seqs)))
     logger.info(f"  control sequences: {len(ctrl_site_seqs):,}")
-
-    # Pre-compute log-odds matrices for motif scan
-    lo_puf60   = _pwm_log_odds(_PUF60_MOTIF)
-    lo_pumilio = _pwm_log_odds(_PUMILIO_MOTIF)
 
     # ── Build figure ────────────────────────────────────────────────────────
     fig = plt.figure(figsize=(20, 42))
@@ -760,52 +886,49 @@ def plot(input_file: str, fasta_file: str, gtf_file: str,
                title="Branch-Point Window (-40 to -10 from 3'SS)\nControl (Unedited Introns)",
                xtick_labels=bp_xticks)
 
-    # ── Row 5: Known reference motif logos ──────────────────────────────────
-    _draw_motif_reference(
-        ax5a, _PUF60_MOTIF,
-        "Reference: PUF60 binding motif (UCUCUUUU consensus)\n"
-        "from ENCODE eCLIP + Salton et al. 2008 EMBO Rep\n"
-        "[PUF60 = Poly-U binding Factor; UHM/RRM protein; NOT pumilio family]"
+    # ── Row 5: De novo k-mer enrichment (5-mer left, 6-mer right) ──────────
+    _draw_kmer_enrichment(
+        ax5a, all_site_seqs, ctrl_site_seqs, k=5,
+        title=f"5-mer enrichment at editing sites vs control\n({label})"
     )
-    _draw_motif_reference(
-        ax5b, _PUMILIO_MOTIF,
-        "Reference: Pumilio / PUF-family motif (UGUAHAUA, H=not G)\n"
-        "Wickens group 'PUF code' — Gerber et al. 2004; Bernstein et al. 2005\n"
-        "[Pumilio-homology domain proteins — distinct from PUF60]"
+    _draw_kmer_enrichment(
+        ax5b, all_site_seqs, ctrl_site_seqs, k=6,
+        title=f"6-mer enrichment at editing sites vs control\n({label})"
     )
 
-    # ── Row 6: Motif enrichment scan at editing site (±15 nt window) ────────
-    _draw_motif_enrichment(
+    # ── Row 6: Relative-entropy logos (KL divergence vs control) ────────────
+    _relative_entropy_logo(
         ax6a, all_site_seqs, ctrl_site_seqs,
-        lo_puf60, 'PUF60 (UC-rich PPT)', flank=15
+        title=f"Sequence enrichment logo ±15 nt — All sites\n(KL-divergence vs matched intronic control; {label})",
+        xtick_labels=xticks,
     )
-    _draw_motif_enrichment(
-        ax6b, all_site_seqs, ctrl_site_seqs,
-        lo_pumilio, 'Pumilio/PUF (UGUAHAUA)', flank=15
+    _relative_entropy_logo(
+        ax6b, intronic_site_seqs, ctrl_site_seqs,
+        title=f"Sequence enrichment logo ±15 nt — Intronic sites only\n(KL-divergence vs matched intronic control; {label})",
+        xtick_labels=xticks,
     )
 
     # ── Row 7: Note ──────────────────────────────────────────────────────────
     ax7.axis('off')
     note = (
         "Notes:\n"
-        "• Sequence logos show information content (bits).\n"
+        "• Rows 0–4: Sequence logos show information content (bits); rows 5–6 show de novo enrichment.\n"
         "• Donor motif (+1/+2 = GT highlighted red); Acceptor motif (-2/-1 = AG highlighted).\n"
         "• Branch-point window: −40 to −10 nt from 3'SS. "
         "Canonical BP consensus = YYYYYYYYYYYYYNYYR[A]Y (branch-point A in brackets).\n"
         "• Control sequences: random intronic positions in the same edited genes "
-        "(introns without editing sites) — controls for gene-composition bias.\n"
-        "• IMPORTANT: PUF60 (Poly-U Factor 60 kDa, FIR/SIAHBP1) contains RRM/UHM "
-        "domains and binds polypyrimidine tracts.  It is NOT a pumilio/PUF-family "
-        "protein. The Wickens-group 'PUF code' (UGUAHAUA) describes pumilio-homology "
-        "domain proteins (Pumilio, FBF, Puf1–5). If a pumilio-type motif is enriched "
-        "at editing sites, that would be unexpected and worth investigating.\n"
+        "(introns without editing sites) — controls for gene-composition and intron-length bias.\n"
+        "• k-mer enrichment (row 5): Fisher exact test (one-sided), Benjamini-Hochberg FDR. "
+        "* FDR<5%, ** FDR<1%, *** FDR<0.1%. Only k-mers with ≥3 occurrences at editing sites shown.\n"
+        "• KL-divergence logo (row 6): height = Σ f_edit[b] × max(0, log2(f_edit[b] / f_ctrl[b])). "
+        "Shows per-base enrichment relative to matched intronic background — not absolute IC.\n"
         f"• Label: {label}"
     )
     ax7.text(0.02, 0.90, note, transform=ax7.transAxes,
              ha='left', va='top', fontsize=9.5, family='monospace',
              bbox=dict(boxstyle='round', facecolor='#f0f4f8', alpha=0.8))
 
-    fig.suptitle(f"HyperTRIBE — Splice Motif Analysis + Known Motif Comparison: {label}",
+    fig.suptitle(f"HyperTRIBE — Splice Site Motif + De Novo Sequence Enrichment: {label}",
                  fontsize=15, fontweight='bold', y=1.002)
 
     Path(output).parent.mkdir(parents=True, exist_ok=True)

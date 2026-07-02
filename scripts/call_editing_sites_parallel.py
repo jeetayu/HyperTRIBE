@@ -3,8 +3,16 @@
 Parallel RNA Editing Site Caller for HyperTRIBE
 ================================================
 
-This script identifies A-to-G RNA editing sites by comparing control and treatment
-BAM files. It uses multiprocessing for efficient analysis of large human genomes.
+This script identifies ADAR-mediated RNA editing sites by comparing control
+and treatment BAM files. It uses multiprocessing for efficient analysis of
+large human genomes.
+
+Scores both A->G (plus-strand-equivalent) and T->C (minus-strand-equivalent)
+positions per-locus based on the control sample's dominant base — see
+_dominant_base_pair(). Before 2026-07-02 this only ever checked A->G, which
+silently missed every editing site on a minus-strand-transcribed locus
+(~half of all real sites in validation against an independent original
+pipeline run; see project_rhadar_manuscript memory for the diagnosis).
 
 Author: Optimized HyperTRIBE Pipeline v2.0
 Date: 2026-01-28
@@ -69,7 +77,8 @@ class EditingSite:
     edit_frequency: float
     fold_change: float
     p_value: float
-    
+    rep_idx: int = 0   # 0-based index of treatment BAM in --treatment list
+
     def to_bed_line(self) -> str:
         """Convert to BED format line"""
         return (
@@ -86,7 +95,8 @@ class EditingSite:
             f"{self.treatment_count.A}\t"
             f"{self.treatment_count.G}\t"
             f"{self.fold_change:.2f}\t"
-            f"{self.p_value:.2e}"
+            f"{self.p_value:.2e}\t"
+            f"{self.rep_idx}"
         )
 
 
@@ -147,13 +157,52 @@ def get_base_counts_at_position(
     return counts
 
 
+def _dominant_base_pair(
+    bc: BaseCount, min_count: float
+) -> Optional[Tuple[str, str]]:
+    """
+    Infer (reference_base, edited_base) at a position from the control's
+    base counts, without requiring a FASTA reference or per-read strand tags.
+
+    ADAR-mediated editing is A->I(G) on the sense strand of the transcribed
+    RNA. On a minus-strand-transcribed locus this appears as T->C on the
+    plus-strand-mapped genomic reference (the reverse complement of A->G).
+    A caller that only ever checks A/G silently misses every site on a
+    minus-strand transcript. Genomic positions are overwhelmingly single-base
+    in real data, so whichever of A or T clears the coverage threshold in the
+    control sample is a reliable proxy for the transcribed strand's
+    reference base (matches the pre-existing 'bc.A >= min_coverage * 0.5'
+    absolute-count convention, extended symmetrically to T).
+
+    Returns None if neither A nor T reaches min_count (ambiguous / not a
+    clean single-base position). If both do (rare: true heterozygous SNP or
+    bidirectional transcription), the higher-count base wins.
+    """
+    a_ok = bc.A >= min_count
+    t_ok = bc.T >= min_count
+    if a_ok and t_ok:
+        return ('A', 'G') if bc.A >= bc.T else ('T', 'C')
+    if a_ok:
+        return ('A', 'G')
+    if t_ok:
+        return ('T', 'C')
+    return None
+
+
 def calculate_editing_statistics(
     control_counts: BaseCount,
     treatment_counts: BaseCount,
-    stat_test: str = 'fisher'
+    stat_test: str = 'fisher',
+    ref_base: str = 'A',
+    edit_base: str = 'G',
 ) -> Tuple[float, float, float]:
     """
     Calculate editing frequency, fold change, and statistical significance.
+
+    ref_base/edit_base select which base pair to score (('A','G') for
+    plus-strand-equivalent editing, ('T','C') for minus-strand-equivalent —
+    see _dominant_base_pair()). Defaults preserve the original A/G-only
+    behavior for any external caller that doesn't pass these explicitly.
 
     stat_test options:
       'fisher'        - one-sided Fisher's exact test on 2x2 contingency table
@@ -163,8 +212,13 @@ def calculate_editing_statistics(
       'none'          - no statistical test; p_value set to 0.0 so all sites
                         passing frequency/fold-change thresholds are retained
     """
-    control_edit = (control_counts.G / control_counts.A) if control_counts.A > 0 else 0
-    treatment_edit = (treatment_counts.G / treatment_counts.A) if treatment_counts.A > 0 else 0
+    ctrl_ref = getattr(control_counts, ref_base)
+    ctrl_edit = getattr(control_counts, edit_base)
+    treat_ref = getattr(treatment_counts, ref_base)
+    treat_edit = getattr(treatment_counts, edit_base)
+
+    control_edit = (ctrl_edit / ctrl_ref) if ctrl_ref > 0 else 0
+    treatment_edit = (treat_edit / treat_ref) if treat_ref > 0 else 0
     edit_freq = treatment_edit * 100
     fold_change = treatment_edit / control_edit if control_edit > 0 else float('inf')
 
@@ -172,16 +226,16 @@ def calculate_editing_statistics(
         p_value = 0.0
 
     elif stat_test == 'hypergeometric':
-        # Hypergeometric: P(X >= treat_G) where X ~ Hypergeom(M, n, N)
-        #   M = control total reads (population size)
-        #   n = control G reads     (successes in population)
-        #   N = treatment total reads (draw size)
-        #   k = treatment G reads     (observed successes)
+        # Hypergeometric: P(X >= treat_edit) where X ~ Hypergeom(M, n, N)
+        #   M = control total ref+edit reads (population size)
+        #   n = control edit reads            (successes in population)
+        #   N = treatment total ref+edit reads (draw size)
+        #   k = treatment edit reads           (observed successes)
         # Falls back to binomial when N > M (treatment depth exceeds control).
-        M = control_counts.A + control_counts.G
-        n = control_counts.G
-        N = treatment_counts.A + treatment_counts.G
-        k = treatment_counts.G
+        M = ctrl_ref + ctrl_edit
+        n = ctrl_edit
+        N = treat_ref + treat_edit
+        k = treat_edit
         try:
             if k == 0:
                 p_value = 1.0
@@ -195,8 +249,8 @@ def calculate_editing_statistics(
 
     else:  # fisher (default)
         contingency_table = [
-            [treatment_counts.G, treatment_counts.A],
-            [control_counts.G,   control_counts.A],
+            [treat_edit, treat_ref],
+            [ctrl_edit,  ctrl_ref],
         ]
         try:
             _, p_value = stats.fisher_exact(contingency_table, alternative='greater')
@@ -269,33 +323,44 @@ def process_chromosome_chunk(args) -> List[EditingSite]:
     # ── Merge control counts across all control BAMs in one pass ─────────────
     ctrl_counts = _pileup_base_counts(control_bams, chromosome, start, end, min_bq, min_mq)
 
-    # ── Pre-filter to positions with adequate A-dominant control coverage ─────
-    candidate_positions = {
-        pos: bc
-        for pos, bc in ctrl_counts.items()
-        if bc.total >= min_cov
-        and bc.A >= min_cov * 0.5
-        and (bc.G / bc.A if bc.A > 0 else 0) <= params['max_control_edit_freq']
-    }
+    # ── Pre-filter to positions with adequate control coverage of either the
+    #    A/G (plus-strand-equivalent) or T/C (minus-strand-equivalent) base
+    #    pair, and acceptable control background on whichever pair applies.
+    #    See _dominant_base_pair() docstring for why both are needed. ───────
+    candidate_positions: Dict[int, Tuple[BaseCount, str, str]] = {}
+    for pos, bc in ctrl_counts.items():
+        if bc.total < min_cov:
+            continue
+        base_pair = _dominant_base_pair(bc, min_cov * 0.5)
+        if base_pair is None:
+            continue
+        ref_base, edit_base = base_pair
+        ctrl_ref = getattr(bc, ref_base)
+        ctrl_edit = getattr(bc, edit_base)
+        if (ctrl_edit / ctrl_ref if ctrl_ref > 0 else 0) <= params['max_control_edit_freq']:
+            candidate_positions[pos] = (bc, ref_base, edit_base)
 
     if not candidate_positions:
         return []
 
     # ── Pileup each treatment BAM once; only score candidate positions ────────
     editing_sites = []
-    for treat_bam in treatment_bams:
+    for rep_idx, treat_bam in enumerate(treatment_bams):
         treat_counts = _pileup_base_counts([treat_bam], chromosome, start, end, min_bq, min_mq)
 
-        for pos, ctrl_bc in candidate_positions.items():
+        for pos, (ctrl_bc, ref_base, edit_base) in candidate_positions.items():
             treat_bc = treat_counts.get(pos, BaseCount())
             if treat_bc.total < min_cov:
                 continue
 
             edit_freq, fold_change, p_value = calculate_editing_statistics(
-                ctrl_bc, treat_bc, stat_test=params.get('stat_test', 'fisher')
+                ctrl_bc, treat_bc, stat_test=params.get('stat_test', 'fisher'),
+                ref_base=ref_base, edit_base=edit_base,
             )
 
-            ctrl_edit_rate = ctrl_bc.G / ctrl_bc.A if ctrl_bc.A > 0 else 0
+            ctrl_ref = getattr(ctrl_bc, ref_base)
+            ctrl_edit = getattr(ctrl_bc, edit_base)
+            ctrl_edit_rate = ctrl_edit / ctrl_ref if ctrl_ref > 0 else 0
             if (edit_freq >= params['min_edit_freq'] * 100
                     and (params['edit_fold_change'] == 0 or fold_change >= params['edit_fold_change'])
                     and ctrl_edit_rate <= params['max_control_edit_freq']
@@ -303,13 +368,14 @@ def process_chromosome_chunk(args) -> List[EditingSite]:
                 editing_sites.append(EditingSite(
                     chromosome=chromosome,
                     position=pos,
-                    strand='.',
+                    strand='+' if ref_base == 'A' else '-',
                     gene='.',
                     control_count=ctrl_bc,
                     treatment_count=treat_bc,
                     edit_frequency=edit_freq,
                     fold_change=fold_change,
                     p_value=p_value,
+                    rep_idx=rep_idx,
                 ))
 
     logger.info(f"Found {len(editing_sites)} sites in {chromosome}:{start}-{end}")
@@ -523,7 +589,7 @@ def main():
             "#chromosome\tstart\tend\tgene\tedit_freq\tstrand\t"
             "control_cov\tcontrol_A\tcontrol_G\t"
             "treatment_cov\ttreatment_A\ttreatment_G\t"
-            "fold_change\tp_value\n"
+            "fold_change\tp_value\trep_idx\n"
         )
         out.write(header)
         
