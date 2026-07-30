@@ -78,9 +78,27 @@ class EditingSite:
     fold_change: float
     p_value: float
     rep_idx: int = 0   # 0-based index of treatment BAM in --treatment list
+    ref_base: str = 'A'   # which BaseCount field was actually scored as "unedited"
+    edit_base: str = 'G'  # which BaseCount field was actually scored as "edited"
+    # ('A','G') for plus-strand-equivalent sites, ('T','C') for minus-strand-
+    # equivalent sites (see _dominant_base_pair()). FIXED 2026-07-29: to_bed_line()
+    # used to hardcode .A/.G here regardless of which pair was actually scored,
+    # so every minus-strand (T/C-scored) site silently wrote near-zero background
+    # A/G counts into the control_A/control_G/treatment_A/treatment_G columns
+    # instead of the real T/C counts actually used for edit_frequency/fold_change/
+    # p_value in this same row -- filter_replicates.py then recomputed pooled
+    # statistics from those wrong columns, discarding real signal (see
+    # feedback_hypertribe_caller_ag_output_bug memory for the full incident/fix).
 
     def to_bed_line(self) -> str:
-        """Convert to BED format line"""
+        """Convert to BED format line.
+
+        control_A/control_G/treatment_A/treatment_G column names are kept as-is
+        for backward compatibility with downstream scripts (filter_replicates.py,
+        annotate_genes.py, etc.) -- but the VALUES are now always whichever base
+        pair was actually scored (ref_base/edit_base), not literal .A/.G, so
+        these columns are correct for both plus- and minus-strand sites.
+        """
         return (
             f"{self.chromosome}\t"
             f"{self.position}\t"
@@ -89,11 +107,11 @@ class EditingSite:
             f"{self.edit_frequency:.2f}\t"
             f"{self.strand}\t"
             f"{self.control_count.total}\t"
-            f"{self.control_count.A}\t"
-            f"{self.control_count.G}\t"
+            f"{getattr(self.control_count, self.ref_base)}\t"
+            f"{getattr(self.control_count, self.edit_base)}\t"
             f"{self.treatment_count.total}\t"
-            f"{self.treatment_count.A}\t"
-            f"{self.treatment_count.G}\t"
+            f"{getattr(self.treatment_count, self.ref_base)}\t"
+            f"{getattr(self.treatment_count, self.edit_base)}\t"
             f"{self.fold_change:.2f}\t"
             f"{self.p_value:.2e}\t"
             f"{self.rep_idx}"
@@ -376,6 +394,8 @@ def process_chromosome_chunk(args) -> List[EditingSite]:
                     fold_change=fold_change,
                     p_value=p_value,
                     rep_idx=rep_idx,
+                    ref_base=ref_base,
+                    edit_base=edit_base,
                 ))
 
     logger.info(f"Found {len(editing_sites)} sites in {chromosome}:{start}-{end}")

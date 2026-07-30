@@ -33,6 +33,8 @@ hypertribe_optimized/  (github.com/jeetayu/HyperTRIBE, branch: snakemake-slurm)
     ├── 📈 plot_chromosome_distribution.py    # Sites per chromosome (raw + sites/Mbp)
     └── 📈 plot_biotype_distribution.py       # Gene biotype bar + pie chart
 │
+├── figures/                                  # Example output figures (see figures/README.md)
+│
 ├── notebooks/
 │   └── 📓 hypertribe_report.qmd             # Quarto HTML/PDF report (replaces generate_report.py)
 │

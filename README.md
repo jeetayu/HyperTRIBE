@@ -272,6 +272,13 @@ Comprehensive HTML report with:
 - `aligned/{sample}.Log.final.out` - Alignment statistics
 - `results/alignment_stats.txt` - Summary of all samples
 
+### Example Figures
+
+See [`figures/`](figures/) for real diagnostic plots produced by the
+`plot_*.py` scripts on a completed run (chromosome distribution, gene
+biotype breakdown, editing-frequency distribution), with both PNG
+previews and vector PDF sources.
+
 ---
 
 ## Performance Benchmarks
@@ -433,6 +440,27 @@ Original HyperTRIBE software is licensed under BSD License.
 - Added statistical testing
 - Comprehensive documentation
 - 7-10x performance improvement
+
+### 2026-07-29 — minus-strand output bug fix
+- Fixed `EditingSite.to_bed_line()` in `call_editing_sites_parallel.py`:
+  it hardcoded `.A`/`.G` BaseCount fields when writing
+  `control_A/control_G/treatment_A/treatment_G` columns, instead of
+  whichever base pair was actually scored. Minus-strand (T→C-scored)
+  sites had correct `edit_freq`/`fold_change`/`p_value` but corrupted
+  count columns — `filter_replicates.py` recomputes stats from those raw
+  count columns, so minus-strand sites silently lost their real signal
+  downstream (e.g. real p=1e-91 became recomputed p=1.0). Affected
+  roughly half of all genes (every minus-strand locus) in any run through
+  2026-07-29. Fixed by writing `getattr(count, ref_base/edit_base)`
+  instead of hardcoded attribute access. `filter_replicates.py` itself
+  needed no change once the upstream columns carry correct values.
+
+### 2026-07-02 — strand-blind caller fix
+- The caller only ever scored A→G editing, never T→C (the signature on
+  minus-strand-transcribed loci) — silently missing roughly half of all
+  true editing sites project-wide from the very first candidate-position
+  pre-filter, not just downstream scoring. Fixed to detect and score both
+  base pairs depending on locus strand.
 
 ### Version 1.0.0 (Original)
 - Initial release by Rosbash Lab
