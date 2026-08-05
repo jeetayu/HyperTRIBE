@@ -46,7 +46,12 @@ plt.rcParams.update({
     'axes.labelsize': 12,
 })
 
-# hg38 chromosome lengths (bp) for density normalisation
+# Chromosome lengths (bp) for density normalisation, by genome build.
+# CRITICAL: pipeline is also run on mouse (mm10 / mm10_chrZ, see IMP2 project's
+# zbp1ko_*/imp2ko_* directories) -- applying hg38 lengths to mm10 chromosome
+# names silently produces wrong "sites per Mbp" density values, not just a
+# mislabeled title. --genome-build must match whatever reference the input
+# BED's editing sites were actually called against.
 HG38_CHR_LENGTHS = {
     'chr1': 248956422, 'chr2': 242193529, 'chr3': 198295559,
     'chr4': 190214555, 'chr5': 181538259, 'chr6': 170805979,
@@ -57,6 +62,26 @@ HG38_CHR_LENGTHS = {
     'chr19': 58617616, 'chr20': 64444167, 'chr21': 46709983,
     'chr22': 50818468, 'chrX': 156040895, 'chrY': 57227415,
     'chrM': 16569,
+}
+
+# mm10 / GRCm38 primary assembly (UCSC mm10 standard lengths). Also used for
+# mm10_chrZ runs (the custom actB-24MS2-ki reporter chromosome, chrZ, is
+# non-standard and excluded from density normalisation the same way any
+# unrecognised chromosome is -- see lengths_mbp NaN handling in plot()).
+MM10_CHR_LENGTHS = {
+    'chr1': 195471971, 'chr2': 182113224, 'chr3': 160039680,
+    'chr4': 156508116, 'chr5': 151834684, 'chr6': 149736546,
+    'chr7': 145441459, 'chr8': 129401213, 'chr9': 124595110,
+    'chr10': 130694993, 'chr11': 122082543, 'chr12': 120129022,
+    'chr13': 120421639, 'chr14': 124902244, 'chr15': 104043685,
+    'chr16': 98207768, 'chr17': 94987271, 'chr18': 90702639,
+    'chr19': 61431566, 'chrX': 171031299, 'chrY': 91744698,
+    'chrM': 16299,
+}
+
+GENOME_BUILDS = {
+    'hg38': ('HG38_CHR_LENGTHS', HG38_CHR_LENGTHS, list(range(1, 23)) + ['X', 'Y', 'M']),
+    'mm10': ('MM10_CHR_LENGTHS', MM10_CHR_LENGTHS, list(range(1, 20)) + ['X', 'Y', 'M']),
 }
 
 _BASE_COLS = [
@@ -83,13 +108,16 @@ def _load_bed(path: str) -> pd.DataFrame:
     return df
 
 
-def plot(input_file: str, output_file: str) -> None:
+def plot(input_file: str, output_file: str, genome_build: str = 'hg38') -> None:
     logger.info(f"Loading: {input_file}")
+    logger.info(f"  Genome build: {genome_build}")
     df = _load_bed(input_file)
     logger.info(f"  {len(df):,} editing sites")
 
+    _, chr_lengths, chrom_numbers = GENOME_BUILDS[genome_build]
+
     # Keep only standard chromosomes
-    standard = [f'chr{i}' for i in list(range(1, 23)) + ['X', 'Y', 'M']]
+    standard = [f'chr{i}' for i in chrom_numbers]
     df_std = df[df['chr'].isin(standard)].copy()
     n_other = len(df) - len(df_std)
     if n_other:
@@ -101,7 +129,7 @@ def plot(input_file: str, output_file: str) -> None:
 
     # Compute density (sites per Mbp)
     lengths_mbp = pd.Series({
-        c: HG38_CHR_LENGTHS.get(c, np.nan) / 1e6 for c in chrs_present
+        c: chr_lengths.get(c, np.nan) / 1e6 for c in chrs_present
     })
     density = counts / lengths_mbp
 
@@ -142,7 +170,7 @@ def plot(input_file: str, output_file: str) -> None:
     ax2.spines['right'].set_visible(False)
     ax2.set_xlabel('Chromosome')
 
-    fig.suptitle('HyperTRIBE — Editing Site Chromosomal Distribution (hg38)',
+    fig.suptitle(f'HyperTRIBE — Editing Site Chromosomal Distribution ({genome_build})',
                  fontsize=14, fontweight='bold', y=1.01)
 
     Path(output_file).parent.mkdir(parents=True, exist_ok=True)
@@ -166,8 +194,11 @@ def main():
                         help='Annotated editing sites BED file')
     parser.add_argument('--output', required=True,
                         help='Output plot file (.pdf or .png)')
+    parser.add_argument('--genome-build', default='hg38', choices=list(GENOME_BUILDS.keys()),
+                        help='Reference genome the input sites were called against '
+                             '(default: hg38; use mm10 for mouse/mm10_chrZ runs)')
     args = parser.parse_args()
-    plot(args.input, args.output)
+    plot(args.input, args.output, genome_build=args.genome_build)
 
 
 if __name__ == '__main__':
